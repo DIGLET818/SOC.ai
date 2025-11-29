@@ -13,9 +13,24 @@ export interface Alert {
     virusTotal: string;
     geoIP: string;
     greyNoise: string;
+    asn: string;
+    reputation: number;
   };
   timeline: {
     timestamp: string;
     event: string;
   }[];
+  ruleCategory: "brute-force" | "malware" | "recon" | "lateral-movement" | "data-exfiltration";
+  mitreTactic: string;
+  mitreId: string;
+  sourceCountry: string;
+  hostContext: {
+    hostname: string;
+    criticality: "critical" | "high" | "medium" | "low";
+    assetOwner: string;
+    os: string;
+    edrStatus: "active" | "inactive" | "degraded";
+  };
+  relatedAlerts?: number;
+  campaignId?: string;
 }

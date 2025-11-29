@@ -1,47 +1,114 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect } from "react";
 import { SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
+import { Button } from "@/components/ui/button";
+import { Switch } from "@/components/ui/switch";
 import { SOCSidebar } from "@/components/SOCSidebar";
 import { StatsOverview } from "@/components/StatsOverview";
+import { MetricsPanel } from "@/components/MetricsPanel";
+import { ThreatMapCard } from "@/components/ThreatMapCard";
 import { SearchBar } from "@/components/SearchBar";
-import { FiltersBar } from "@/components/FiltersBar";
+import { EnhancedFiltersBar } from "@/components/EnhancedFiltersBar";
 import { AlertsTable } from "@/components/AlertsTable";
-import { AlertDetailPanel } from "@/components/AlertDetailPanel";
+import { IncidentDrawer } from "@/components/IncidentDrawer";
+import { CaseManagement } from "@/components/CaseManagement";
+import { NotificationsPanel } from "@/components/NotificationsPanel";
 import { Alert } from "@/types/alert";
 import { mockAlerts } from "@/data/mockAlerts";
+import { Radio, RefreshCw } from "lucide-react";
+import { toast } from "@/hooks/use-toast";
 
 const Index = () => {
   const [searchQuery, setSearchQuery] = useState("");
   const [severity, setSeverity] = useState("all");
   const [status, setStatus] = useState("all");
+  const [ruleCategory, setRuleCategory] = useState("all");
+  const [mitreTactic, setMitreTactic] = useState("all");
+  const [sourceCountry, setSourceCountry] = useState("all");
+  const [assetCriticality, setAssetCriticality] = useState("all");
   const [dateRange, setDateRange] = useState<{ from: Date | undefined; to: Date | undefined }>({
     from: undefined,
     to: undefined,
   });
   const [selectedAlert, setSelectedAlert] = useState<Alert | null>(null);
   const [detailPanelOpen, setDetailPanelOpen] = useState(false);
+  const [realtimeMode, setRealtimeMode] = useState(false);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+
+  // Simulate real-time alerts
+  useEffect(() => {
+    if (realtimeMode) {
+      const interval = setInterval(() => {
+        toast({
+          title: "New Alert Detected",
+          description: "High severity alert from 198.51.100.89",
+          duration: 3000,
+        });
+      }, 15000);
+      return () => clearInterval(interval);
+    }
+  }, [realtimeMode]);
 
   const filteredAlerts = useMemo(() => {
     return mockAlerts.filter((alert) => {
-      // Search filter
       const matchesSearch =
         searchQuery === "" ||
         alert.sourceIp.toLowerCase().includes(searchQuery.toLowerCase()) ||
         alert.ruleName.toLowerCase().includes(searchQuery.toLowerCase()) ||
-        (alert.sourceUser?.toLowerCase().includes(searchQuery.toLowerCase()) ?? false);
+        (alert.sourceUser?.toLowerCase().includes(searchQuery.toLowerCase()) ?? false) ||
+        alert.id.toLowerCase().includes(searchQuery.toLowerCase());
 
-      // Severity filter
       const matchesSeverity = severity === "all" || alert.severity === severity;
-
-      // Status filter
       const matchesStatus = status === "all" || alert.status === status;
+      const matchesRuleCategory = ruleCategory === "all" || alert.ruleCategory === ruleCategory;
+      const matchesMitreTactic =
+        mitreTactic === "all" ||
+        alert.mitreTactic.toLowerCase().includes(mitreTactic.toLowerCase());
+      const matchesSourceCountry =
+        sourceCountry === "all" ||
+        alert.sourceCountry.toLowerCase() === sourceCountry.toLowerCase();
+      const matchesAssetCriticality =
+        assetCriticality === "all" || alert.hostContext.criticality === assetCriticality;
 
-      return matchesSearch && matchesSeverity && matchesStatus;
+      return (
+        matchesSearch &&
+        matchesSeverity &&
+        matchesStatus &&
+        matchesRuleCategory &&
+        matchesMitreTactic &&
+        matchesSourceCountry &&
+        matchesAssetCriticality
+      );
     });
-  }, [searchQuery, severity, status]);
+  }, [searchQuery, severity, status, ruleCategory, mitreTactic, sourceCountry, assetCriticality]);
 
   const handleAlertClick = (alert: Alert) => {
     setSelectedAlert(alert);
     setDetailPanelOpen(true);
+  };
+
+  const handleClearFilters = () => {
+    setSeverity("all");
+    setStatus("all");
+    setRuleCategory("all");
+    setMitreTactic("all");
+    setSourceCountry("all");
+    setAssetCriticality("all");
+    setDateRange({ from: undefined, to: undefined });
+  };
+
+  const handleRefresh = () => {
+    setIsRefreshing(true);
+    toast({
+      title: "Refreshing Data",
+      description: "Fetching latest alerts...",
+    });
+    setTimeout(() => {
+      setIsRefreshing(false);
+      toast({
+        title: "Data Refreshed",
+        description: "Alert data updated successfully",
+      });
+    }, 1000);
   };
 
   return (
@@ -49,38 +116,84 @@ const Index = () => {
       <div className="min-h-screen flex w-full bg-background">
         <SOCSidebar />
         <div className="flex-1 flex flex-col">
-          <header className="h-14 border-b border-border flex items-center px-6 bg-card">
-            <SidebarTrigger className="mr-4" />
-            <h1 className="text-xl font-semibold text-foreground">Security Operations Center</h1>
+          <header className="h-14 border-b border-border flex items-center justify-between px-6 bg-card shadow-sm">
+            <div className="flex items-center gap-4">
+              <SidebarTrigger className="" />
+              <h1 className="text-xl font-semibold text-foreground">
+                Security Operations Center
+              </h1>
+            </div>
+            <div className="flex items-center gap-4">
+              <div className="flex items-center gap-2">
+                <Radio className={`h-4 w-4 ${realtimeMode ? "text-severity-high animate-pulse" : "text-muted-foreground"}`} />
+                <span className="text-sm text-muted-foreground">Real-time</span>
+                <Switch checked={realtimeMode} onCheckedChange={setRealtimeMode} />
+              </div>
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={handleRefresh}
+                disabled={isRefreshing}
+              >
+                <RefreshCw className={`h-5 w-5 ${isRefreshing ? "animate-spin" : ""}`} />
+              </Button>
+              <NotificationsPanel />
+            </div>
           </header>
 
           <main className="flex-1 p-6 space-y-6 overflow-auto">
             <StatsOverview />
 
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+              <div className="lg:col-span-2">
+                <MetricsPanel />
+              </div>
+              <div>
+                <ThreatMapCard />
+              </div>
+            </div>
+
             <div className="space-y-4">
               <SearchBar value={searchQuery} onChange={setSearchQuery} />
-              <FiltersBar
+              <EnhancedFiltersBar
                 severity={severity}
                 status={status}
+                ruleCategory={ruleCategory}
+                mitreTactic={mitreTactic}
+                sourceCountry={sourceCountry}
+                assetCriticality={assetCriticality}
                 dateRange={dateRange}
                 onSeverityChange={setSeverity}
                 onStatusChange={setStatus}
+                onRuleCategoryChange={setRuleCategory}
+                onMitreTacticChange={setMitreTactic}
+                onSourceCountryChange={setSourceCountry}
+                onAssetCriticalityChange={setAssetCriticality}
                 onDateRangeChange={setDateRange}
+                onClearFilters={handleClearFilters}
               />
             </div>
 
             <div>
               <div className="flex items-center justify-between mb-4">
                 <h2 className="text-lg font-semibold text-foreground">
-                  Alerts ({filteredAlerts.length})
+                  Active Alerts ({filteredAlerts.length})
                 </h2>
+                {realtimeMode && (
+                  <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                    <div className="h-2 w-2 rounded-full bg-severity-high animate-pulse" />
+                    Live monitoring active
+                  </div>
+                )}
               </div>
               <AlertsTable alerts={filteredAlerts} onAlertClick={handleAlertClick} />
             </div>
+
+            <CaseManagement />
           </main>
         </div>
 
-        <AlertDetailPanel
+        <IncidentDrawer
           alert={selectedAlert}
           open={detailPanelOpen}
           onClose={() => setDetailPanelOpen(false)}
