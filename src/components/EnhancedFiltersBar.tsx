@@ -50,9 +50,15 @@ export function EnhancedFiltersBar({
     dateRange.from ||
     dateRange.to;
 
+  const setQuickDateRange = (hours: number) => {
+    const now = new Date();
+    const from = new Date(now.getTime() - hours * 60 * 60 * 1000);
+    onDateRangeChange({ from, to: now });
+  };
+
   return (
     <div className="space-y-3">
-      <div className="flex items-center gap-2">
+      <div className="flex items-center gap-2 flex-wrap">
         <Filter className="h-4 w-4 text-muted-foreground" />
         <span className="text-sm font-medium text-foreground">Filters</span>
         {hasActiveFilters && (
@@ -65,6 +71,33 @@ export function EnhancedFiltersBar({
             Clear all
           </Button>
         )}
+        <div className="flex items-center gap-2 ml-auto">
+          <span className="text-xs text-muted-foreground">Quick:</span>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setQuickDateRange(1)}
+            className="h-7 text-xs"
+          >
+            Last 1h
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setQuickDateRange(24)}
+            className="h-7 text-xs"
+          >
+            Last 24h
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setQuickDateRange(168)}
+            className="h-7 text-xs"
+          >
+            Last 7d
+          </Button>
+        </div>
       </div>
       <div className="flex flex-wrap gap-3">
         <Select value={severity} onValueChange={onSeverityChange}>
