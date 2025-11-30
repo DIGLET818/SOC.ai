@@ -295,14 +295,14 @@ export function IncidentDrawer({ alert, open, onClose }: IncidentDrawerProps) {
 
           {/* Action Buttons */}
           <div className="grid grid-cols-2 gap-3 pt-4 pb-6">
-            <Button onClick={() => handleAction("Approved actions")} className="w-full shadow-md">
+            <Button onClick={() => handleAction("Approved actions")} className="w-full shadow-md hover:shadow-lg transition-all">
               <CheckCircle className="mr-2 h-4 w-4" />
               Approve Actions
             </Button>
             <Button
               variant="destructive"
               onClick={() => handleAction("Blocked IP")}
-              className="w-full shadow-md"
+              className="w-full shadow-md hover:shadow-lg transition-all"
             >
               <Ban className="mr-2 h-4 w-4" />
               Block IP
@@ -310,15 +310,23 @@ export function IncidentDrawer({ alert, open, onClose }: IncidentDrawerProps) {
             <Button
               variant="outline"
               onClick={() => handleAction("Disabled user account")}
-              className="w-full"
+              className="w-full hover:bg-destructive/10 hover:border-destructive transition-all"
             >
               <UserX className="mr-2 h-4 w-4" />
               Disable User
             </Button>
             <Button
               variant="outline"
+              onClick={() => handleAction("Isolated endpoint")}
+              className="w-full hover:bg-severity-high/10 hover:border-severity-high transition-all"
+            >
+              <Network className="mr-2 h-4 w-4" />
+              Isolate Endpoint
+            </Button>
+            <Button
+              variant="outline"
               onClick={() => handleAction("Created case")}
-              className="w-full"
+              className="w-full hover:bg-primary/10 hover:border-primary transition-all"
             >
               <AlertTriangle className="mr-2 h-4 w-4" />
               Create Case
@@ -326,10 +334,10 @@ export function IncidentDrawer({ alert, open, onClose }: IncidentDrawerProps) {
             <Button
               variant="secondary"
               onClick={() => handleAction("Marked as resolved")}
-              className="w-full col-span-2"
+              className="w-full hover:bg-severity-info/20 transition-all"
             >
               <XCircle className="mr-2 h-4 w-4" />
-              Mark as Resolved
+              Close Alert
             </Button>
           </div>
         </div>

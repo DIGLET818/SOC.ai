@@ -12,6 +12,7 @@ import { AlertsTable } from "@/components/AlertsTable";
 import { IncidentDrawer } from "@/components/IncidentDrawer";
 import { CaseManagement } from "@/components/CaseManagement";
 import { NotificationsPanel } from "@/components/NotificationsPanel";
+import { ThemeToggle } from "@/components/ThemeToggle";
 import { Alert } from "@/types/alert";
 import { mockAlerts } from "@/data/mockAlerts";
 import { Radio, RefreshCw } from "lucide-react";
@@ -116,7 +117,7 @@ const Index = () => {
       <div className="min-h-screen flex w-full bg-background">
         <SOCSidebar />
         <div className="flex-1 flex flex-col">
-          <header className="h-14 border-b border-border flex items-center justify-between px-6 bg-card shadow-sm">
+          <header className="h-14 border-b border-border flex items-center justify-between px-6 bg-card shadow-sm backdrop-blur-sm">
             <div className="flex items-center gap-4">
               <SidebarTrigger className="" />
               <h1 className="text-xl font-semibold text-foreground">
@@ -124,7 +125,7 @@ const Index = () => {
               </h1>
             </div>
             <div className="flex items-center gap-4">
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-muted/50 border border-border">
                 <Radio className={`h-4 w-4 ${realtimeMode ? "text-severity-high animate-pulse" : "text-muted-foreground"}`} />
                 <span className="text-sm text-muted-foreground">Real-time</span>
                 <Switch checked={realtimeMode} onCheckedChange={setRealtimeMode} />
@@ -134,9 +135,11 @@ const Index = () => {
                 size="icon"
                 onClick={handleRefresh}
                 disabled={isRefreshing}
+                className="hover:bg-accent/10 transition-colors"
               >
                 <RefreshCw className={`h-5 w-5 ${isRefreshing ? "animate-spin" : ""}`} />
               </Button>
+              <ThemeToggle />
               <NotificationsPanel />
             </div>
           </header>
@@ -174,15 +177,15 @@ const Index = () => {
               />
             </div>
 
-            <div>
+            <div className="animate-fade-in">
               <div className="flex items-center justify-between mb-4">
                 <h2 className="text-lg font-semibold text-foreground">
                   Active Alerts ({filteredAlerts.length})
                 </h2>
                 {realtimeMode && (
-                  <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                    <div className="h-2 w-2 rounded-full bg-severity-high animate-pulse" />
-                    Live monitoring active
+                  <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-severity-high/10 border border-severity-high/30 text-sm">
+                    <div className="h-2 w-2 rounded-full bg-severity-high animate-pulse shadow-[0_0_8px_hsl(var(--severity-high))]" />
+                    <span className="text-severity-high font-medium">Live monitoring active</span>
                   </div>
                 )}
               </div>
