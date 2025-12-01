@@ -1,4 +1,4 @@
-import { Shield, AlertTriangle, FileText, Settings, Activity } from "lucide-react";
+import { Shield, AlertTriangle, FileText, Settings, Activity, FileBarChart } from "lucide-react";
 import { NavLink } from "@/components/NavLink";
 import {
   Sidebar,
@@ -16,6 +16,7 @@ const menuItems = [
   { title: "Alerts", url: "/", icon: AlertTriangle },
   { title: "Incidents", url: "/incidents", icon: Shield },
   { title: "Threat Intelligence", url: "/threat-intel", icon: Activity },
+  { title: "SIEM Use Cases", url: "/siem-use-cases", icon: FileBarChart },
   { title: "Reports", url: "/reports", icon: FileText },
   { title: "Settings", url: "/settings", icon: Settings },
 ];
