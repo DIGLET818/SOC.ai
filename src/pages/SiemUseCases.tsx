@@ -1,235 +1,337 @@
-import { useState, useCallback } from "react";
+import { useCallback, useState, useEffect } from "react";
 import { SidebarProvider } from "@/components/ui/sidebar";
 import { SOCSidebar } from "@/components/SOCSidebar";
 import { ThemeToggle } from "@/components/ThemeToggle";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Upload, FileSpreadsheet } from "lucide-react";
+import { Upload, FileSpreadsheet, RefreshCw } from "lucide-react";
 import { SiemUseCaseTable } from "@/components/SiemUseCaseTable";
 import { SiemUseCase } from "@/types/siemUseCase";
 import Papa from "papaparse";
 import * as XLSX from "xlsx";
 import { useToast } from "@/hooks/use-toast";
 
-export default function SiemUseCases() {
-  const [useCases, setUseCases] = useState<SiemUseCase[]>([]);
-  const [monthColumns, setMonthColumns] = useState<string[]>([]);
-  const [isDragging, setIsDragging] = useState(false);
-  const { toast } = useToast();
+interface SiemUseCasesProps {
+    useCases: SiemUseCase[];
+    setUseCases: (data: SiemUseCase[]) => void;
+    monthColumns: string[];
+    setMonthColumns: (cols: string[]) => void;
+}
 
-  const parseFile = useCallback((file: File) => {
-    const fileExtension = file.name.split(".").pop()?.toLowerCase();
+export default function SiemUseCases({
+    useCases,
+    setUseCases,
+    monthColumns,
+    setMonthColumns,
+}: SiemUseCasesProps) {
+    const [isDragging, setIsDragging] = useState(false);
+    const { toast } = useToast();
 
-    if (fileExtension === "csv") {
-      // Parse CSV using papaparse
-      Papa.parse(file, {
-        header: true,
-        skipEmptyLines: true,
-        complete: (results) => {
-          processData(results.data as Record<string, string>[]);
-        },
-        error: (error) => {
-          toast({
-            title: "Parse Error",
-            description: `Failed to parse CSV: ${error.message}`,
-            variant: "destructive",
-          });
-        },
-      });
-    } else if (fileExtension === "xlsx" || fileExtension === "xls") {
-      // Parse Excel using xlsx
-      const reader = new FileReader();
-      reader.onload = (e) => {
+    // ------------------------------------------------------------------
+    // INITIALIZE FROM LOCALSTORAGE ON MOUNT (PERSIST SHEET ACROSS REFRESH)
+    // ------------------------------------------------------------------
+    useEffect(() => {
         try {
-          const data = new Uint8Array(e.target?.result as ArrayBuffer);
-          const workbook = XLSX.read(data, { type: "array" });
-          const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
-          const jsonData = XLSX.utils.sheet_to_json(firstSheet, { header: 1 });
-          
-          // Convert to objects with headers
-          const headers = jsonData[0] as string[];
-          const rows = jsonData.slice(1) as any[][];
-          const objects = rows.map((row) => {
-            const obj: Record<string, string> = {};
-            headers.forEach((header, index) => {
-              obj[header] = row[index]?.toString() || "";
-            });
-            return obj;
-          });
+            const savedUseCases = localStorage.getItem("siemUseCases");
+            const savedMonthCols = localStorage.getItem("siemMonthColumns");
 
-          processData(objects);
+            if (savedUseCases) {
+                const parsedUseCases = JSON.parse(savedUseCases) as SiemUseCase[];
+                if (parsedUseCases.length > 0) {
+                    setUseCases(parsedUseCases);
+                }
+            }
+
+            if (savedMonthCols) {
+                const parsedMonthCols = JSON.parse(savedMonthCols) as string[];
+                if (parsedMonthCols.length > 0) {
+                    setMonthColumns(parsedMonthCols);
+                }
+            }
         } catch (error) {
-          toast({
-            title: "Parse Error",
-            description: "Failed to parse Excel file",
-            variant: "destructive",
-          });
+            console.warn("Failed to load SIEM data from localStorage:", error);
         }
-      };
-      reader.readAsArrayBuffer(file);
-    } else {
-      toast({
-        title: "Invalid File Type",
-        description: "Please upload a CSV or Excel file (.csv, .xlsx, .xls)",
-        variant: "destructive",
-      });
-    }
-  }, [toast]);
+        // run only once on mount
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
 
-  const processData = (data: Record<string, string>[]) => {
-    if (data.length === 0) {
-      toast({
-        title: "Empty File",
-        description: "The uploaded file contains no data",
-        variant: "destructive",
-      });
-      return;
-    }
+    // Persist state to localStorage on changes
+    useEffect(() => {
+        if (useCases.length > 0) {
+            try {
+                localStorage.setItem("siemUseCases", JSON.stringify(useCases));
+            } catch (error) {
+                console.warn("Failed to save SIEM use cases to localStorage:", error);
+            }
+        } else {
+            // if cleared, also clear storage
+            localStorage.removeItem("siemUseCases");
+        }
+    }, [useCases]);
 
-    // Get all headers
-    const headers = Object.keys(data[0]);
-    
-    // Map headers (case-insensitive)
-    const headerMap: Record<string, string> = {};
-    headers.forEach((header) => {
-      const lower = header.toLowerCase().trim();
-      headerMap[lower] = header;
-    });
+    useEffect(() => {
+        if (monthColumns.length > 0) {
+            try {
+                localStorage.setItem(
+                    "siemMonthColumns",
+                    JSON.stringify(monthColumns)
+                );
+            } catch (error) {
+                console.warn("Failed to save SIEM month columns to localStorage:", error);
+            }
+        } else {
+            localStorage.removeItem("siemMonthColumns");
+        }
+    }, [monthColumns]);
 
-    // Identify month columns (anything that looks like a date or month)
-    const monthCols = headers.filter((header) => {
-      const lower = header.toLowerCase();
-      return (
-        /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b/i.test(lower) ||
-        /\d{2}/.test(lower)
-      );
-    });
+    // Clear localStorage when new upload starts
+    const clearSiemData = useCallback(() => {
+        setUseCases([]);
+        setMonthColumns([]);
+        localStorage.removeItem("siemUseCases");
+        localStorage.removeItem("siemMonthColumns");
+    }, [setUseCases, setMonthColumns]);
 
-    setMonthColumns(monthCols);
+    /* ------------------------------------------------------------------
+       PROCESS DATA
+    ------------------------------------------------------------------ */
+    const processData = useCallback(
+        (data: Record<string, string>[]) => {
+            clearSiemData();
 
-    // Parse use cases
-    const parsedUseCases: SiemUseCase[] = data.map((row, index) => {
-      const monthlyData: Record<string, string | number> = {};
-      monthCols.forEach((month) => {
-        const value = row[month];
-        monthlyData[month] = value || "-";
-      });
+            if (data.length === 0) {
+                toast({
+                    title: "Empty File",
+                    description: "The uploaded file contains no data",
+                    variant: "destructive",
+                });
+                return;
+            }
 
-      return {
-        id: `${index}-${Date.now()}`,
-        ruleName: row[headerMap["rule name"]] || row[headerMap["rulename"]] || "",
-        pbSeverity: row[headerMap["pb-severity"]] || row[headerMap["pbseverity"]] || row[headerMap["severity"]] || "",
-        ruleCondition: row[headerMap["rule condition"]] || row[headerMap["rulecondition"]] || row[headerMap["condition"]] || "",
-        logSource: row[headerMap["log source"]] || row[headerMap["logsource"]] || row[headerMap["source"]] || "",
-        team: row[headerMap["team"]] || "",
-        latestIncident: row[headerMap["latest incident"]] || row[headerMap["latestincident"]] || "",
-        alertReceived: row[headerMap["alert received"]] || row[headerMap["alertreceived"]] || "",
-        remarks: row[headerMap["remarks"]] || row[headerMap["remark"]] || "",
-        monthlyData,
-      };
-    });
+            const headers = Object.keys(data[0]);
+            const headerMap: Record<string, string> = {};
+            headers.forEach((header) => {
+                const lower = header.toLowerCase().trim();
+                headerMap[lower] = header;
+            });
 
-    setUseCases(parsedUseCases);
-    toast({
-      title: "File Uploaded Successfully",
-      description: `Loaded ${parsedUseCases.length} use cases`,
-    });
-  };
+            const now = new Date();
+            const monthNames = [
+                "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+            ];
+            const prev1 = (now.getMonth() - 1 + 12) % 12;
+            const prev2 = (now.getMonth() - 2 + 12) % 12;
+            const prev3 = (now.getMonth() - 3 + 12) % 12;
 
-  const handleFileInput = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      parseFile(file);
-    }
-  };
+            const monthCols = [
+                monthNames[prev3],
+                monthNames[prev2],
+                monthNames[prev1],
+            ];
 
-  const handleDrop = (e: React.DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    setIsDragging(false);
-    const file = e.dataTransfer.files[0];
-    if (file) {
-      parseFile(file);
-    }
-  };
+            setMonthColumns(monthCols);
 
-  const handleDragOver = (e: React.DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    setIsDragging(true);
-  };
+            const parsedUseCases: SiemUseCase[] = data.map((row, index) => {
+                const monthlyData: Record<string, string> = {};
+                monthCols.forEach((month) => {
+                    const value = row[month];
+                    monthlyData[month] = value || "-";
+                });
 
-  const handleDragLeave = () => {
-    setIsDragging(false);
-  };
+                return {
+                    id: `${index}-${Date.now()}`,
+                    ruleName:
+                        row[headerMap["rule name"]] ||
+                        row[headerMap["rulename"]] ||
+                        "",
+                    pbSeverity:
+                        row[headerMap["pb-severity"]] ||
+                        row[headerMap["pbseverity"]] ||
+                        row[headerMap["severity"]] ||
+                        "",
+                    ruleCondition:
+                        row[headerMap["rule condition"]] ||
+                        row[headerMap["rulecondition"]] ||
+                        row[headerMap["condition"]] ||
+                        "",
+                    logSource:
+                        row[headerMap["log source"]] ||
+                        row[headerMap["logsource"]] ||
+                        row[headerMap["source"]] ||
+                        "",
+                    team: row[headerMap["team"]] || "",
+                    alertReceived:
+                        row[headerMap["alert received"]] ||
+                        row[headerMap["alertreceived"]] ||
+                        "",
+                    remarks:
+                        row[headerMap["remarks"]] ||
+                        row[headerMap["remark"]] ||
+                        "",
+                    monthlyData,
+                };
+            });
 
-  return (
-    <SidebarProvider>
-      <div className="min-h-screen flex w-full bg-background">
-        <SOCSidebar />
-        <main className="flex-1 overflow-auto">
-          {/* Header */}
-          <header className="sticky top-0 z-20 border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
-            <div className="flex h-16 items-center justify-between px-6">
-              <div>
-                <h1 className="text-2xl font-bold tracking-tight">SIEM Use Cases</h1>
-                <p className="text-sm text-muted-foreground">
-                  Upload and manage your SIEM detection use cases
-                </p>
-              </div>
-              <ThemeToggle />
+            setUseCases(parsedUseCases);
+            toast({
+                title: "File Uploaded Successfully",
+                description: `Loaded ${parsedUseCases.length} use cases`,
+            });
+        },
+        [clearSiemData, setMonthColumns, setUseCases, toast]
+    );
+
+    /* ------------------------------------------------------------------
+       PARSE FILE
+    ------------------------------------------------------------------ */
+    const parseFile = useCallback(
+        (file: File) => {
+            const fileExtension = file.name.split(".").pop()?.toLowerCase();
+
+            if (fileExtension === "csv") {
+                Papa.parse(file, {
+                    header: true,
+                    skipEmptyLines: true,
+                    complete: (results) => {
+                        processData(results.data as Record<string, string>[]);
+                    },
+                    error: (error) => {
+                        toast({
+                            title: "Parse Error",
+                            description: `Failed to parse CSV: ${error.message}`,
+                            variant: "destructive",
+                        });
+                    },
+                });
+            } else if (fileExtension === "xlsx" || fileExtension === "xls") {
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    try {
+                        const data = new Uint8Array(e.target?.result as ArrayBuffer);
+                        const workbook = XLSX.read(data, { type: "array" });
+                        const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
+                        const jsonData = XLSX.utils.sheet_to_json(firstSheet, {
+                            header: 1,
+                        });
+
+                        const headers = jsonData[0] as string[];
+                        const rows = jsonData.slice(1) as (string | number | null)[][];
+
+                        const objects = rows.map((row) => {
+                            const obj: Record<string, string> = {};
+                            headers.forEach((header, index) => {
+                                obj[header] = row[index]?.toString() || "";
+                            });
+                            return obj;
+                        });
+
+                        processData(objects);
+                    } catch (error) {
+                        toast({
+                            title: "Parse Error",
+                            description: "Failed to parse Excel file",
+                            variant: "destructive",
+                        });
+                    }
+                };
+                reader.readAsArrayBuffer(file);
+            } else {
+                toast({
+                    title: "Invalid File Type",
+                    description:
+                        "Please upload a CSV or Excel file (.csv, .xlsx, .xls)",
+                    variant: "destructive",
+                });
+            }
+        },
+        [processData, toast]
+    );
+
+    /* ------------------------------------------------------------------
+       DRAG & DROP HANDLERS
+    ------------------------------------------------------------------ */
+    const handleFileInput = (e: React.ChangeEvent<HTMLInputElement>) => {
+        const file = e.target.files?.[0];
+        if (file) parseFile(file);
+    };
+
+    const handleDrop = (e: React.DragEvent) => {
+        e.preventDefault();
+        setIsDragging(false);
+        const file = e.dataTransfer.files[0];
+        if (file) parseFile(file);
+    };
+
+    const handleDragOver = (e: React.DragEvent) => {
+        e.preventDefault();
+        setIsDragging(true);
+    };
+
+    const handleDragLeave = () => setIsDragging(false);
+
+    /* ------------------------------------------------------------------
+       UI
+    ------------------------------------------------------------------ */
+    return (
+        <SidebarProvider>
+            <div className="flex min-h-screen w-full bg-background">
+
+                <SOCSidebar />
+                <main className="flex-1 flex flex-col overflow-hidden">
+                    {/* Ultra-compact header bar */}
+                    <header className="border-b border-border px-4 py-1.5 flex items-center justify-between bg-card/50">
+                        <div className="flex items-center gap-4">
+                            <h1 className="text-lg font-semibold text-foreground">SIEM Use Cases</h1>
+
+                            {/* Inline upload section */}
+                            <div
+                                className={`flex items-center gap-2 px-3 py-1 rounded-md border transition-colors ${isDragging
+                                        ? "border-primary bg-primary/10"
+                                        : "border-border/50 bg-background/50"
+                                    }`}
+                                onDrop={handleDrop}
+                                onDragOver={handleDragOver}
+                                onDragLeave={handleDragLeave}
+                            >
+                                <FileSpreadsheet className="h-4 w-4 text-muted-foreground" />
+                                <span className="text-xs text-muted-foreground hidden sm:inline">Drop file or</span>
+
+                                <input
+                                    type="file"
+                                    accept=".csv,.xlsx,.xls"
+                                    onChange={handleFileInput}
+                                    className="hidden"
+                                    id="file-upload"
+                                />
+
+                                <label htmlFor="file-upload">
+                                    <Button asChild size="sm" variant="ghost" className="h-6 px-2 text-xs">
+                                        <span>
+                                            <Upload className="h-3 w-3 mr-1" />
+                                            Upload
+                                        </span>
+                                    </Button>
+                                </label>
+                                <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    className="h-6 px-2 text-xs"
+                                    onClick={() => console.log("Fetch all incidents")}
+                                >
+                                    <RefreshCw className="h-3 w-3 mr-1" />
+                                    Fetch
+                                </Button>
+                            </div>
+                        </div>
+                        <ThemeToggle />
+                    </header>
+
+                    {/* Use Cases Table - takes full remaining space */}
+                    <div className="flex-1 flex flex-col overflow-hidden p-2">
+                        <SiemUseCaseTable useCases={useCases} monthColumns={monthColumns} />
+                    </div>
+                </main>
             </div>
-          </header>
-
-          <div className="p-6 space-y-6">
-            {/* Upload Card */}
-            <Card>
-              <CardHeader>
-                <CardTitle>Upload Use Cases</CardTitle>
-                <CardDescription>
-                  Upload a CSV or Excel file containing your SIEM use cases
-                </CardDescription>
-              </CardHeader>
-              <CardContent>
-                <div
-                  onDrop={handleDrop}
-                  onDragOver={handleDragOver}
-                  onDragLeave={handleDragLeave}
-                  className={`border-2 border-dashed rounded-lg p-8 text-center transition-colors ${
-                    isDragging
-                      ? "border-primary bg-primary/5"
-                      : "border-border hover:border-primary/50"
-                  }`}
-                >
-                  <FileSpreadsheet className="mx-auto h-12 w-12 text-muted-foreground mb-4" />
-                  <p className="text-sm text-muted-foreground mb-4">
-                    Drag and drop your file here, or click to browse
-                  </p>
-                  <input
-                    type="file"
-                    accept=".csv,.xlsx,.xls"
-                    onChange={handleFileInput}
-                    className="hidden"
-                    id="file-upload"
-                  />
-                  <label htmlFor="file-upload">
-                    <Button asChild>
-                      <span>
-                        <Upload className="mr-2 h-4 w-4" />
-                        Upload Excel/CSV
-                      </span>
-                    </Button>
-                  </label>
-                  <p className="text-xs text-muted-foreground mt-3">
-                    Supported formats: .csv, .xlsx, .xls
-                  </p>
-                </div>
-              </CardContent>
-            </Card>
-
-            {/* Use Cases Table */}
-            <SiemUseCaseTable useCases={useCases} monthColumns={monthColumns} />
-          </div>
-        </main>
-      </div>
-    </SidebarProvider>
-  );
+        </SidebarProvider>
+    );
 }
