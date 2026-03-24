@@ -3,32 +3,20 @@ import { SidebarProvider } from "@/components/ui/sidebar";
 import { SOCSidebar } from "@/components/SOCSidebar";
 import { ThemeToggle } from "@/components/ThemeToggle";
 import { Button } from "@/components/ui/button";
-import { Upload, FileSpreadsheet, RefreshCw } from "lucide-react";
+import { Upload, RefreshCw } from "lucide-react";
 import { SiemUseCaseTable } from "@/components/SiemUseCaseTable";
 import { SiemUseCase } from "@/types/siemUseCase";
 import Papa from "papaparse";
 import * as XLSX from "xlsx";
 import { useToast } from "@/hooks/use-toast";
 
-interface SiemUseCasesProps {
-    useCases: SiemUseCase[];
-    setUseCases: (data: SiemUseCase[]) => void;
-    monthColumns: string[];
-    setMonthColumns: (cols: string[]) => void;
-}
-
-export default function SiemUseCases({
-    useCases,
-    setUseCases,
-    monthColumns,
-    setMonthColumns,
-}: SiemUseCasesProps) {
+export default function SiemUseCases() {
+    const [useCases, setUseCases] = useState<SiemUseCase[]>([]);
+    const [monthColumns, setMonthColumns] = useState<string[]>([]);
     const [isDragging, setIsDragging] = useState(false);
     const { toast } = useToast();
 
-    // ------------------------------------------------------------------
-    // INITIALIZE FROM LOCALSTORAGE ON MOUNT (PERSIST SHEET ACROSS REFRESH)
-    // ------------------------------------------------------------------
+    // Load from localStorage on mount
     useEffect(() => {
         try {
             const savedUseCases = localStorage.getItem("siemUseCases");
@@ -50,11 +38,9 @@ export default function SiemUseCases({
         } catch (error) {
             console.warn("Failed to load SIEM data from localStorage:", error);
         }
-        // run only once on mount
-        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
-    // Persist state to localStorage on changes
+    // Persist useCases to localStorage
     useEffect(() => {
         if (useCases.length > 0) {
             try {
@@ -63,18 +49,15 @@ export default function SiemUseCases({
                 console.warn("Failed to save SIEM use cases to localStorage:", error);
             }
         } else {
-            // if cleared, also clear storage
             localStorage.removeItem("siemUseCases");
         }
     }, [useCases]);
 
+    // Persist monthColumns to localStorage
     useEffect(() => {
         if (monthColumns.length > 0) {
             try {
-                localStorage.setItem(
-                    "siemMonthColumns",
-                    JSON.stringify(monthColumns)
-                );
+                localStorage.setItem("siemMonthColumns", JSON.stringify(monthColumns));
             } catch (error) {
                 console.warn("Failed to save SIEM month columns to localStorage:", error);
             }
@@ -83,17 +66,43 @@ export default function SiemUseCases({
         }
     }, [monthColumns]);
 
-    // Clear localStorage when new upload starts
+    // Handle cell updates - THIS IS THE KEY FIX!
+    const handleUpdateUseCase = useCallback(
+        (id: string, field: keyof SiemUseCase | string, value: string) => {
+            setUseCases((prevUseCases) =>
+                prevUseCases.map((useCase) => {
+                    if (useCase.id !== id) return useCase;
+
+                    // Handle nested monthlyData fields
+                    if (field.startsWith("monthlyData.")) {
+                        const month = field.replace("monthlyData.", "");
+                        return {
+                            ...useCase,
+                            monthlyData: {
+                                ...useCase.monthlyData,
+                                [month]: value,
+                            },
+                        };
+                    }
+
+                    // Handle regular fields
+                    return {
+                        ...useCase,
+                        [field]: value,
+                    };
+                })
+            );
+        },
+        []
+    );
+
     const clearSiemData = useCallback(() => {
         setUseCases([]);
         setMonthColumns([]);
         localStorage.removeItem("siemUseCases");
         localStorage.removeItem("siemMonthColumns");
-    }, [setUseCases, setMonthColumns]);
+    }, []);
 
-    /* ------------------------------------------------------------------
-       PROCESS DATA
-    ------------------------------------------------------------------ */
     const processData = useCallback(
         (data: Record<string, string>[]) => {
             clearSiemData();
@@ -123,12 +132,7 @@ export default function SiemUseCases({
             const prev2 = (now.getMonth() - 2 + 12) % 12;
             const prev3 = (now.getMonth() - 3 + 12) % 12;
 
-            const monthCols = [
-                monthNames[prev3],
-                monthNames[prev2],
-                monthNames[prev1],
-            ];
-
+            const monthCols = [monthNames[prev3], monthNames[prev2], monthNames[prev1]];
             setMonthColumns(monthCols);
 
             const parsedUseCases: SiemUseCase[] = data.map((row, index) => {
@@ -141,9 +145,7 @@ export default function SiemUseCases({
                 return {
                     id: `${index}-${Date.now()}`,
                     ruleName:
-                        row[headerMap["rule name"]] ||
-                        row[headerMap["rulename"]] ||
-                        "",
+                        row[headerMap["rule name"]] || row[headerMap["rulename"]] || "",
                     pbSeverity:
                         row[headerMap["pb-severity"]] ||
                         row[headerMap["pbseverity"]] ||
@@ -164,10 +166,7 @@ export default function SiemUseCases({
                         row[headerMap["alert received"]] ||
                         row[headerMap["alertreceived"]] ||
                         "",
-                    remarks:
-                        row[headerMap["remarks"]] ||
-                        row[headerMap["remark"]] ||
-                        "",
+                    remarks: row[headerMap["remarks"]] || row[headerMap["remark"]] || "",
                     monthlyData,
                 };
             });
@@ -178,12 +177,9 @@ export default function SiemUseCases({
                 description: `Loaded ${parsedUseCases.length} use cases`,
             });
         },
-        [clearSiemData, setMonthColumns, setUseCases, toast]
+        [clearSiemData, toast]
     );
 
-    /* ------------------------------------------------------------------
-       PARSE FILE
-    ------------------------------------------------------------------ */
     const parseFile = useCallback(
         (file: File) => {
             const fileExtension = file.name.split(".").pop()?.toLowerCase();
@@ -210,9 +206,7 @@ export default function SiemUseCases({
                         const data = new Uint8Array(e.target?.result as ArrayBuffer);
                         const workbook = XLSX.read(data, { type: "array" });
                         const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
-                        const jsonData = XLSX.utils.sheet_to_json(firstSheet, {
-                            header: 1,
-                        });
+                        const jsonData = XLSX.utils.sheet_to_json(firstSheet, { header: 1 });
 
                         const headers = jsonData[0] as string[];
                         const rows = jsonData.slice(1) as (string | number | null)[][];
@@ -238,8 +232,7 @@ export default function SiemUseCases({
             } else {
                 toast({
                     title: "Invalid File Type",
-                    description:
-                        "Please upload a CSV or Excel file (.csv, .xlsx, .xls)",
+                    description: "Please upload a CSV or Excel file (.csv, .xlsx, .xls)",
                     variant: "destructive",
                 });
             }
@@ -247,9 +240,6 @@ export default function SiemUseCases({
         [processData, toast]
     );
 
-    /* ------------------------------------------------------------------
-       DRAG & DROP HANDLERS
-    ------------------------------------------------------------------ */
     const handleFileInput = (e: React.ChangeEvent<HTMLInputElement>) => {
         const file = e.target.files?.[0];
         if (file) parseFile(file);
@@ -269,45 +259,34 @@ export default function SiemUseCases({
 
     const handleDragLeave = () => setIsDragging(false);
 
-    /* ------------------------------------------------------------------
-       UI
-    ------------------------------------------------------------------ */
     return (
         <SidebarProvider>
-            <div className="flex min-h-screen w-full bg-background">
-
+            <div
+                className={`flex min-h-screen w-full ${isDragging ? "bg-primary/5" : ""}`}
+                onDrop={handleDrop}
+                onDragOver={handleDragOver}
+                onDragLeave={handleDragLeave}
+            >
                 <SOCSidebar />
-                <main className="flex-1 flex flex-col overflow-hidden">
-                    {/* Ultra-compact header bar */}
-                    <header className="border-b border-border px-4 py-1.5 flex items-center justify-between bg-card/50">
+                <main className="flex flex-1 flex-col overflow-hidden">
+                    {/* Header */}
+                    <header className="flex items-center justify-between border-b px-4 py-2">
                         <div className="flex items-center gap-4">
-                            <h1 className="text-lg font-semibold text-foreground">SIEM Use Cases</h1>
+                            <h1 className="text-xl font-semibold">SIEM Use Cases</h1>
 
-                            {/* Inline upload section */}
-                            <div
-                                className={`flex items-center gap-2 px-3 py-1 rounded-md border transition-colors ${isDragging
-                                        ? "border-primary bg-primary/10"
-                                        : "border-border/50 bg-background/50"
-                                    }`}
-                                onDrop={handleDrop}
-                                onDragOver={handleDragOver}
-                                onDragLeave={handleDragLeave}
-                            >
-                                <FileSpreadsheet className="h-4 w-4 text-muted-foreground" />
-                                <span className="text-xs text-muted-foreground hidden sm:inline">Drop file or</span>
-
-                                <input
-                                    type="file"
-                                    accept=".csv,.xlsx,.xls"
-                                    onChange={handleFileInput}
-                                    className="hidden"
-                                    id="file-upload"
-                                />
-
-                                <label htmlFor="file-upload">
-                                    <Button asChild size="sm" variant="ghost" className="h-6 px-2 text-xs">
-                                        <span>
-                                            <Upload className="h-3 w-3 mr-1" />
+                            {/* Upload section */}
+                            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                                <span>Drop file or</span>
+                                <label>
+                                    <input
+                                        type="file"
+                                        accept=".csv,.xlsx,.xls"
+                                        onChange={handleFileInput}
+                                        className="hidden"
+                                    />
+                                    <Button variant="ghost" size="sm" asChild>
+                                        <span className="cursor-pointer">
+                                            <Upload className="mr-1 h-4 w-4" />
                                             Upload
                                         </span>
                                     </Button>
@@ -315,10 +294,9 @@ export default function SiemUseCases({
                                 <Button
                                     variant="ghost"
                                     size="sm"
-                                    className="h-6 px-2 text-xs"
                                     onClick={() => console.log("Fetch all incidents")}
                                 >
-                                    <RefreshCw className="h-3 w-3 mr-1" />
+                                    <RefreshCw className="mr-1 h-4 w-4" />
                                     Fetch
                                 </Button>
                             </div>
@@ -326,9 +304,13 @@ export default function SiemUseCases({
                         <ThemeToggle />
                     </header>
 
-                    {/* Use Cases Table - takes full remaining space */}
-                    <div className="flex-1 flex flex-col overflow-hidden p-2">
-                        <SiemUseCaseTable useCases={useCases} monthColumns={monthColumns} />
+                    {/* Table */}
+                    <div className="flex-1 overflow-hidden p-4">
+                        <SiemUseCaseTable
+                            useCases={useCases}
+                            monthColumns={monthColumns}
+                            onUpdateUseCase={handleUpdateUseCase}
+                        />
                     </div>
                 </main>
             </div>

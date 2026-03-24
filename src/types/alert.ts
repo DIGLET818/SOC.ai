@@ -66,4 +66,7 @@ export interface Alert {
 
     relatedAlerts?: number;
     campaignId?: string;
+
+    /** When set to "gmail", alert was loaded from Gmail (email-based). */
+    source?: "gmail" | string;
 }

@@ -15,7 +15,9 @@ import { NotificationsPanel } from "@/components/NotificationsPanel";
 import { ThemeToggle } from "@/components/ThemeToggle";
 import { Alert } from "@/types/alert";
 import { mockAlerts } from "@/data/mockAlerts";
-import { Radio, RefreshCw } from "lucide-react";
+import { getGmailAuthStatus, getGmailAlerts } from "@/api/alerts";
+import { API_BASE_URL } from "@/api/client";
+import { Radio, RefreshCw, Mail, Inbox } from "lucide-react";
 import { toast } from "@/hooks/use-toast";
 
 const Index = () => {
@@ -35,6 +37,59 @@ const Index = () => {
   const [realtimeMode, setRealtimeMode] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
 
+  // Gmail: connect + load alerts from mail
+  const [gmailAvailable, setGmailAvailable] = useState(false);
+  const [gmailConnected, setGmailConnected] = useState(false);
+  const [gmailAlerts, setGmailAlerts] = useState<Alert[]>([]);
+  const [loadingGmail, setLoadingGmail] = useState(false);
+
+  const allAlerts = useMemo(
+    () => [...gmailAlerts, ...mockAlerts],
+    [gmailAlerts]
+  );
+
+  useEffect(() => {
+    getGmailAuthStatus()
+      .then((s) => {
+        setGmailAvailable(s.gmailAvailable);
+        setGmailConnected(s.connected);
+      })
+      .catch(() => setGmailAvailable(false));
+  }, []);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("gmail_connected") === "1") {
+      setGmailConnected(true);
+      toast({ title: "Gmail connected", description: "You can load alerts from your inbox." });
+      window.history.replaceState({}, "", window.location.pathname);
+    }
+  }, []);
+
+  const handleConnectGmail = () => {
+    window.location.href = `${API_BASE_URL}/auth/google`;
+  };
+
+  const handleLoadFromGmail = async () => {
+    setLoadingGmail(true);
+    try {
+      const alerts = (await getGmailAlerts({ max_results: 50 })) as Alert[];
+      setGmailAlerts(alerts);
+      toast({
+        title: "Alerts loaded from Gmail",
+        description: `${alerts.length} email alert(s) added.`,
+      });
+    } catch (e) {
+      toast({
+        title: "Failed to load Gmail alerts",
+        description: e instanceof Error ? e.message : "Check backend and try again.",
+        variant: "destructive",
+      });
+    } finally {
+      setLoadingGmail(false);
+    }
+  };
+
   // Simulate real-time alerts
   useEffect(() => {
     if (realtimeMode) {
@@ -50,7 +105,7 @@ const Index = () => {
   }, [realtimeMode]);
 
   const filteredAlerts = useMemo(() => {
-    return mockAlerts.filter((alert) => {
+    return allAlerts.filter((alert) => {
       const matchesSearch =
         searchQuery === "" ||
         alert.sourceIp.toLowerCase().includes(searchQuery.toLowerCase()) ||
@@ -80,7 +135,7 @@ const Index = () => {
         matchesAssetCriticality
       );
     });
-  }, [searchQuery, severity, status, ruleCategory, mitreTactic, sourceCountry, assetCriticality]);
+  }, [allAlerts, searchQuery, severity, status, ruleCategory, mitreTactic, sourceCountry, assetCriticality]);
 
   const handleAlertClick = (alert: Alert) => {
     setSelectedAlert(alert);
@@ -125,6 +180,37 @@ const Index = () => {
               </h1>
             </div>
             <div className="flex items-center gap-4">
+              {gmailAvailable && (
+                <>
+                  {gmailConnected ? (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={handleLoadFromGmail}
+                      disabled={loadingGmail}
+                      className="gap-2"
+                    >
+                      <Inbox className="h-4 w-4" />
+                      {loadingGmail ? "Loading…" : "Load from Gmail"}
+                    </Button>
+                  ) : (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={handleConnectGmail}
+                      className="gap-2"
+                    >
+                      <Mail className="h-4 w-4" />
+                      Connect Gmail
+                    </Button>
+                  )}
+                  {gmailConnected && (
+                    <span className="text-xs text-muted-foreground px-2 py-1 rounded bg-muted/50">
+                      Gmail connected
+                    </span>
+                  )}
+                </>
+              )}
               <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-muted/50 border border-border">
                 <Radio className={`h-4 w-4 ${realtimeMode ? "text-severity-high animate-pulse" : "text-muted-foreground"}`} />
                 <span className="text-sm text-muted-foreground">Real-time</span>

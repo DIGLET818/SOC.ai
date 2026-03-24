@@ -3,7 +3,7 @@ import { Badge } from "@/components/ui/badge";
 import { SeverityBadge } from "./SeverityBadge";
 import { StatusBadge } from "./StatusBadge";
 import { Alert } from "@/types/alert";
-import { Network } from "lucide-react";
+import { Network, Mail } from "lucide-react";
 
 interface AlertsTableProps {
   alerts: Alert[];
@@ -33,7 +33,16 @@ export function AlertsTable({ alerts, onAlertClick }: AlertsTableProps) {
               className="cursor-pointer hover:bg-muted/30 transition-all"
               onClick={() => onAlertClick(alert)}
             >
-              <TableCell className="font-mono text-primary font-medium">{alert.id}</TableCell>
+              <TableCell className="font-mono text-primary font-medium">
+                <div className="flex items-center gap-2">
+                  {alert.id}
+                  {alert.source === "gmail" && (
+                    <Badge variant="secondary" className="text-xs gap-1">
+                      <Mail className="h-3 w-3" /> Gmail
+                    </Badge>
+                  )}
+                </div>
+              </TableCell>
               <TableCell className="text-muted-foreground text-sm">{alert.timestamp}</TableCell>
               <TableCell>
                 <div className="font-medium">{alert.ruleName}</div>

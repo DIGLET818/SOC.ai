@@ -1,4 +1,4 @@
-﻿// client.ts
+// client.ts
 export const API_BASE_URL = "http://127.0.0.1:5000/api";
 
 /**
@@ -27,7 +27,14 @@ async function request<T>(
 
         if (!resp.ok) {
             const text = await resp.text();
-            throw new Error(`API error (${resp.status}): ${text}`);
+            try {
+                const json = JSON.parse(text) as { error?: string; detail?: string };
+                const msg = json.error || json.detail || text;
+                throw new Error(msg);
+            } catch (parseErr) {
+                if (parseErr instanceof Error && parseErr.message !== text) throw parseErr;
+                throw new Error(`API error (${resp.status}): ${text}`);
+            }
         }
 
         const text = await resp.text();

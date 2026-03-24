@@ -1,4 +1,4 @@
-import { useState, useMemo } from "react";
+﻿import { useState, useMemo } from "react";
 import { SiemUseCase } from "@/types/siemUseCase";
 import {
     Table,
@@ -38,6 +38,8 @@ export function SiemUseCaseTable({ useCases, monthColumns, onFetchAllIncidents, 
     const [alertReceivedFilter, setAlertReceivedFilter] = useState("all");
     const [editingCell, setEditingCell] = useState<{ id: string; field: string } | null>(null);
     const [editValue, setEditValue] = useState("");
+    // Local edits storage for when onUpdateUseCase is not provided
+    const [localEdits, setLocalEdits] = useState<Record<string, Record<string, string>>>({});
 
     const handleCellClick = (id: string, field: string, currentValue: string) => {
         setEditingCell({ id, field });
@@ -45,11 +47,26 @@ export function SiemUseCaseTable({ useCases, monthColumns, onFetchAllIncidents, 
     };
 
     const handleCellBlur = () => {
-        if (editingCell && onUpdateUseCase) {
-            onUpdateUseCase(editingCell.id, editingCell.field, editValue);
+        if (editingCell) {
+            if (onUpdateUseCase) {
+                onUpdateUseCase(editingCell.id, editingCell.field, editValue);
+            }
+            // Always store locally to persist the edit
+            setLocalEdits(prev => ({
+                ...prev,
+                [editingCell.id]: {
+                    ...prev[editingCell.id],
+                    [editingCell.field]: editValue
+                }
+            }));
         }
         setEditingCell(null);
         setEditValue("");
+    };
+
+    // Helper to get the current value (local edit or original)
+    const getCellValue = (id: string, field: string, originalValue: string): string => {
+        return localEdits[id]?.[field] ?? originalValue;
     };
 
     const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -61,9 +78,10 @@ export function SiemUseCaseTable({ useCases, monthColumns, onFetchAllIncidents, 
         }
     };
 
-    const renderEditableCell = (id: string, field: string, value: string, className?: string) => {
+    const renderEditableCell = (id: string, field: string, originalValue: string, className?: string) => {
         const isEditing = editingCell?.id === id && editingCell?.field === field;
-        const isEmpty = !value || value === "-";
+        const value = getCellValue(id, field, originalValue);
+        const isEmpty = !value || value === "-" || value.trim() === "";
 
         if (isEditing) {
             return (
@@ -78,12 +96,68 @@ export function SiemUseCaseTable({ useCases, monthColumns, onFetchAllIncidents, 
             );
         }
 
+        // Show actual content if not empty, otherwise show editable placeholder
+        if (!isEmpty) {
+            return (
+                <span
+                    onClick={() => handleCellClick(id, field, value)}
+                    className={`cursor-pointer hover:bg-muted/50 px-1 py-0.5 rounded inline-block ${className || ""}`}
+                >
+                    {value}
+                </span>
+            );
+        }
+
+        // Empty cell - show clickable placeholder
         return (
             <span
-                onClick={() => handleCellClick(id, field, value)}
-                className={`cursor-pointer hover:bg-muted/50 px-1 py-0.5 rounded min-w-[20px] inline-block ${isEmpty ? "text-muted-foreground/50 italic" : ""} ${className || ""}`}
+                onClick={() => handleCellClick(id, field, "")}
+                className={`cursor-pointer hover:bg-muted/50 px-1 py-0.5 rounded min-w-[40px] min-h-[20px] inline-flex items-center justify-center text-muted-foreground/40 hover:text-muted-foreground/60 hover:border hover:border-dashed hover:border-muted-foreground/30 transition-all ${className || ""}`}
+                title="Click to edit"
             >
-                {isEmpty ? "�" : value}
+                ◆
+            </span>
+        );
+    };
+
+    const renderEditableSeverityCell = (id: string, originalValue: string) => {
+        const isEditing = editingCell?.id === id && editingCell?.field === "pbSeverity";
+        const value = getCellValue(id, "pbSeverity", originalValue);
+        const isEmpty = !value || value === "-" || value.trim() === "";
+
+        if (isEditing) {
+            return (
+                <input
+                    autoFocus
+                    value={editValue}
+                    onChange={(e) => setEditValue(e.target.value)}
+                    onBlur={handleCellBlur}
+                    onKeyDown={handleKeyDown}
+                    className="w-full bg-background border border-primary rounded px-1 py-0.5 text-sm focus:outline-none"
+                />
+            );
+        }
+
+        if (!isEmpty) {
+            return (
+                <Badge
+                    variant={getSeverityColor(value)}
+                    className="cursor-pointer hover:opacity-80 transition-opacity"
+                    onClick={() => handleCellClick(id, "pbSeverity", value)}
+                >
+                    {value}
+                </Badge>
+            );
+        }
+
+        // Empty severity - show clickable placeholder
+        return (
+            <span
+                onClick={() => handleCellClick(id, "pbSeverity", "")}
+                className="cursor-pointer hover:bg-muted/50 px-1 py-0.5 rounded min-w-[40px] min-h-[20px] inline-flex items-center justify-center text-muted-foreground/40 hover:text-muted-foreground/60 hover:border hover:border-dashed hover:border-muted-foreground/30 transition-all"
+                title="Click to edit"
+            >
+                ◆
             </span>
         );
     };
@@ -345,13 +419,7 @@ export function SiemUseCaseTable({ useCases, monthColumns, onFetchAllIncidents, 
                                         </div>
                                     </td>
                                     <td className="p-4 align-middle">
-                                        {useCase.pbSeverity ? (
-                                            <Badge variant={getSeverityColor(useCase.pbSeverity)}>
-                                                {useCase.pbSeverity}
-                                            </Badge>
-                                        ) : (
-                                            renderEditableCell(useCase.id, "pbSeverity", useCase.pbSeverity)
-                                        )}
+                                        {renderEditableSeverityCell(useCase.id, useCase.pbSeverity)}
                                     </td>
                                     <td className="p-4 align-middle text-sm">
                                         {renderEditableCell(useCase.id, "ruleCondition", useCase.ruleCondition)}

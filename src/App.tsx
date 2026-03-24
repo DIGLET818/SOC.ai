@@ -8,6 +8,8 @@ import { ThemeProvider } from "next-themes";
 
 import Index from "./pages/Index";
 import Incidents from "./pages/Incidents";
+import DailyAlerts from "./pages/DailyAlerts";
+import JiraTickets from "./pages/JiraTickets";
 import ThreatIntel from "./pages/ThreatIntel";
 import SiemUseCases from "./pages/SiemUseCases";
 import Reports from "./pages/Reports";
@@ -33,6 +35,8 @@ const App = () => {
                         <Routes>
                             <Route path="/" element={<Index />} />
                             <Route path="/incidents" element={<Incidents />} />
+                            <Route path="/daily-alerts" element={<DailyAlerts />} />
+                            <Route path="/jira-tickets" element={<JiraTickets />} />
                             <Route path="/threat-intel" element={<ThreatIntel />} />
                             <Route
                                 path="/siem-use-cases"
