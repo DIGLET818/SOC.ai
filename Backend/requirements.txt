@@ -1,7 +1,13 @@
 Flask==2.3.2
+flask-cors>=4.0.0
 python-dotenv>=1.0.0
 requests>=2.28.0
 google-api-python-client==2.97.0
 google-auth==2.22.0
 google-auth-oauthlib==0.8.0
 python-dateutil==2.8.2
+
+# DB layer (SQLite by default; switch to Postgres later by setting DATABASE_URL=postgresql+psycopg2://...)
+SQLAlchemy>=2.0,<3.0
+# itsdangerous already ships with Flask, but pin it explicitly for the signed session cookie
+itsdangerous>=2.1.2

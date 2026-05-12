@@ -4,11 +4,22 @@ Google OAuth for Gmail read-only access.
 Run backend from Backend/ so credentials.json and token.json paths resolve.
 """
 import os
+from typing import Optional, Tuple
+
 from flask import redirect, request
 
 from google_auth_oauthlib.flow import Flow
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
 
-SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+# `gmail.readonly` powers the existing email features.
+# `userinfo.email` + `openid` let us identify which Google account signed in,
+# so the backend can issue a session cookie tied to a `users` row.
+SCOPES = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "openid",
+]
 
 # Paths relative to Backend/
 BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -65,3 +76,34 @@ def remove_token():
             os.remove(TOKEN_PATH)
         except OSError:
             pass
+
+
+def _load_credentials() -> Optional[Credentials]:
+    if not os.path.exists(TOKEN_PATH):
+        return None
+    try:
+        return Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
+    except Exception:
+        return None
+
+
+def get_current_account_identity() -> Tuple[Optional[str], Optional[str]]:
+    """
+    Look up the currently-connected Google account's (email, display_name) by
+    calling Gmail's `users.getProfile` (the email field is part of the userinfo
+    scope we now request). Returns (None, None) if not connected or the call
+    fails -- callers must handle that gracefully.
+    """
+    creds = _load_credentials()
+    if creds is None:
+        return None, None
+    try:
+        service = build("gmail", "v1", credentials=creds, cache_discovery=False)
+        profile = service.users().getProfile(userId="me").execute()
+        email = profile.get("emailAddress")
+        # Gmail profile doesn't return a display name; we leave name=None and
+        # let callers update it later if they fetch People API.
+        return (email, None)
+    except Exception as exc:
+        print("get_current_account_identity failed:", exc, flush=True)
+        return None, None

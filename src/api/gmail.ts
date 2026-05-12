@@ -5,6 +5,9 @@
 import api from "./client";
 import type { GmailMessage } from "@/types/gmail";
 
+/** Lookback for incident/ticket ID search; must stay ≤ backend max (`newer_than_days` in main.py, currently 450). */
+export const GMAIL_INCIDENT_LOOKUP_LOOKBACK_DAYS = 400;
+
 export interface GetGmailMessagesParams {
   from: string;
   subject?: string;
@@ -38,7 +41,7 @@ export async function getGmailMessageBySearch(params: {
   from?: string;
   newerThanDays?: number;
 }): Promise<GmailMessage | null> {
-  const { q, from = "nttin.support@global.ntt", newerThanDays = 30 } = params;
+  const { q, from = "nttin.support@global.ntt", newerThanDays = GMAIL_INCIDENT_LOOKUP_LOOKBACK_DAYS } = params;
   if (!q.trim()) return null;
   const search = new URLSearchParams({
     q: q.trim(),
@@ -73,7 +76,7 @@ export async function fetchLatestStatusFromEmail(params: {
   from?: string;
   newerThanDays?: number;
 }): Promise<LatestStatusFromEmailResult> {
-  const { q, from, newerThanDays = 30 } = params;
+  const { q, from, newerThanDays = GMAIL_INCIDENT_LOOKUP_LOOKBACK_DAYS } = params;
   if (!q.trim()) {
     return { suggestedStatus: null };
   }
@@ -84,4 +87,57 @@ export async function fetchLatestStatusFromEmail(params: {
   if (from?.trim()) search.set("from", from.trim());
   const res = await api.get<LatestStatusFromEmailResult>(`/gmail/latest-status?${search.toString()}`);
   return res ?? { suggestedStatus: null };
+}
+
+/** Per-rule Gmail search result (SIEM Master ↔ mailbox analysis). */
+export interface GmailRuleHitRow {
+  rule_name: string;
+  search_token: string;
+  gmail_query: string;
+  match_count: number;
+  capped_at_max: boolean;
+  sample_subjects: string[];
+  error?: string;
+}
+
+export interface GmailRuleHitsSummary {
+  rules_submitted: number;
+  rules_with_hits: number;
+  rules_with_zero_hits: number;
+  sum_match_count_first_page: number;
+}
+
+export interface GmailRuleHitsResponse {
+  after_date: string;
+  before_date: string;
+  from_filter: string | null;
+  summary: GmailRuleHitsSummary;
+  results: GmailRuleHitRow[];
+}
+
+/** Map SIEM Master rule names to Gmail message counts in a date range (uses leading rule id when present). */
+export async function postGmailRuleHits(body: {
+  ruleNames: string[];
+  afterDate: string;
+  beforeDate: string;
+  fromFilter?: string;
+  maxResultsPerRule?: number;
+  sampleN?: number;
+}): Promise<GmailRuleHitsResponse> {
+  const {
+    ruleNames,
+    afterDate,
+    beforeDate,
+    fromFilter,
+    maxResultsPerRule = 500,
+    sampleN = 3,
+  } = body;
+  return api.post<GmailRuleHitsResponse>("/gmail/rule-hits", {
+    rule_names: ruleNames,
+    after_date: afterDate.trim(),
+    before_date: beforeDate.trim(),
+    ...(fromFilter?.trim() ? { from_filter: fromFilter.trim() } : {}),
+    max_results_per_rule: maxResultsPerRule,
+    sample_n: sampleN,
+  });
 }

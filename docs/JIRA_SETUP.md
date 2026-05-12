@@ -79,3 +79,24 @@ Use your project’s actual custom field IDs (the numbers differ per Jira instan
 **Security:** Do not commit `.env` or any file containing the API token. The repo’s `.gitignore` already excludes `.env`.
 
 After these are set and the backend is restarted, you can use **“Create in Jira”** on the Jira Tickets page to create one Jira task per selected alert.
+
+---
+
+## Troubleshooting
+
+### `401` / “You do not have permission to create issues in this project”
+
+This is returned by Jira when the **Atlassian account** tied to `JIRA_EMAIL` / `JIRA_API_TOKEN` is authenticated but **may not create issues** in the project named by `JIRA_PROJECT_KEY`.
+
+**Fix (Jira admin / project admin):**
+
+1. In Jira, open **Project settings → Permissions** (or your org’s permission scheme for that project).
+2. Ensure your user (or a group that contains your user) has **Create issues** (and usually **Browse projects**).
+3. Confirm `JIRA_PROJECT_KEY` is the **short key** of the project where you are allowed to create work (e.g. `SOC` from issue keys like `SOC-123`).
+
+**Also check:**
+
+- The API token was created while logged in as the **same** account as `JIRA_EMAIL`.
+- You did not typo the project key (wrong key can still lead to permission errors depending on instance).
+
+**Bulk “Create all in Jira”:** If the first create fails with this error, stop fixing env/permissions before retrying — every row would fail the same way until permissions are corrected.

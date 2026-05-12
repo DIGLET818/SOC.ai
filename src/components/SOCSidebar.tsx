@@ -1,4 +1,4 @@
-import { Shield, AlertTriangle, FileText, Settings, Activity, FileBarChart, Calendar, Ticket } from "lucide-react";
+import { Shield, AlertTriangle, FileText, Settings, Activity, FileBarChart, Calendar, CalendarRange, Ticket, LineChart, BarChart3 } from "lucide-react";
 import { NavLink } from "@/components/NavLink";
 import {
   Sidebar,
@@ -16,9 +16,12 @@ const menuItems = [
   { title: "Alerts", url: "/", icon: AlertTriangle },
   { title: "Incidents", url: "/incidents", icon: Shield },
   { title: "Daily Alerts", url: "/daily-alerts", icon: Calendar },
+  { title: "Yearly data", url: "/weekly-reports/yearly", icon: BarChart3 },
+  { title: "Weekly Reports", url: "/weekly-reports", icon: CalendarRange },
   { title: "Jira Tickets", url: "/jira-tickets", icon: Ticket },
   { title: "Threat Intelligence", url: "/threat-intel", icon: Activity },
-  { title: "SIEM Use Cases", url: "/siem-use-cases", icon: FileBarChart },
+  { title: "SIEM Use case", url: "/siem-use-cases", icon: FileBarChart },
+  { title: "Use case Analysis", url: "/analysis", icon: LineChart },
   { title: "Reports", url: "/reports", icon: FileText },
   { title: "Settings", url: "/settings", icon: Settings },
 ];

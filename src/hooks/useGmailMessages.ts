@@ -2,8 +2,11 @@
  * Hook to load Gmail messages (e.g. from nttin.support@global.ntt, last 24h).
  * Optional storageKey: persist emails in sessionStorage, or when persistInLocalStorage:
  *   IndexedDB (large quota — much more than localStorage ~5MB) + legacy localStorage migration.
+ *
+ * IndexedDB writes are awaited and fetches are serialized so hydration/refetch cannot race
+ * and overwrite a fuller in-memory merge with a stale IDB read.
  */
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useLayoutEffect, useCallback, useRef } from "react";
 import { getGmailMessages } from "@/api/gmail";
 import type { GmailMessage } from "@/types/gmail";
 import { idbDeleteMonthEmails, idbGetMonthEmails, idbPutMonthEmails } from "@/lib/emailCacheDb";
@@ -46,24 +49,8 @@ function loadLegacyLocalStorageSync(key: string): GmailMessage[] {
   return DEFAULT_STORAGE;
 }
 
-/**
- * sessionStorage: still ~5MB; strip bodies and trim if needed.
- * localStorage path uses IndexedDB instead (see persistMessages).
- */
-function persistMessages(storageKey: string, useLocal: boolean, messages: GmailMessage[]): GmailMessage[] {
-  if (useLocal) {
-    const stripped = messages.map(stripHeavyFieldsForStorage);
-    void idbPutMonthEmails(storageKey, stripped).catch((e) => {
-      console.warn("useGmailMessages: IndexedDB cache write failed:", e);
-    });
-    try {
-      localStorage.removeItem(storageKey);
-    } catch {
-      /* ignore */
-    }
-    return messages;
-  }
-
+/** Session / non-IDB persistence (sync). */
+function persistSessionStorage(storageKey: string, useLocal: boolean, messages: GmailMessage[]): GmailMessage[] {
   const storage = getStorage(storageKey, useLocal);
   const stripped = messages.map(stripHeavyFieldsForStorage);
 
@@ -103,6 +90,16 @@ function persistMessages(storageKey: string, useLocal: boolean, messages: GmailM
   return messages;
 }
 
+async function persistIdb(storageKey: string, messages: GmailMessage[]): Promise<void> {
+  const stripped = messages.map(stripHeavyFieldsForStorage);
+  await idbPutMonthEmails(storageKey, stripped);
+  try {
+    localStorage.removeItem(storageKey);
+  } catch {
+    /* ignore */
+  }
+}
+
 function loadFromSessionStorage(key: string): GmailMessage[] {
   try {
     const storage = getStorage(key, false);
@@ -112,6 +109,20 @@ function loadFromSessionStorage(key: string): GmailMessage[] {
     /* ignore */
   }
   return DEFAULT_STORAGE;
+}
+
+/** Merge by message id; later lists override earlier (API wins over cache). */
+function mergeEmailListsById(...lists: (GmailMessage[] | null | undefined)[]): GmailMessage[] {
+  const map = new Map<string, GmailMessage>();
+  for (const list of lists) {
+    if (!list?.length) continue;
+    for (const e of list) {
+      if (e?.id) map.set(e.id, e);
+    }
+  }
+  return Array.from(map.values()).sort(
+    (a, b) => (Number(a.internalDate) || 0) - (Number(b.internalDate) || 0)
+  );
 }
 
 export interface UseGmailMessagesParams {
@@ -136,6 +147,11 @@ export interface UseGmailMessagesResult {
   refetch: () => Promise<void>;
   /** Fetch a date range and merge into existing emails (by id). Use for fetching a single day without re-fetching the whole month. */
   refetchDateRange: (afterDate: string, beforeDate: string) => Promise<void>;
+  /**
+   * True while the hook is restoring cached emails from IndexedDB / sessionStorage on first mount or after
+   * a storageKey change. Use this in the UI to avoid flashing an "empty state" before the cache hydrates.
+   */
+  isHydratingFromCache: boolean;
 }
 
 export function useGmailMessages({
@@ -158,138 +174,206 @@ export function useGmailMessages({
   });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /**
+   * True while we wait for the async IndexedDB read on first mount (or after a storageKey change).
+   * For non-IDB (sessionStorage) we hydrate sync, so it stays false there.
+   */
+  const [isHydratingFromCache, setIsHydratingFromCache] = useState<boolean>(() =>
+    Boolean(storageKey && persistInLocalStorage)
+  );
 
-  const prevStorageKey = useRef(storageKey);
+  /** Mirrors `emails` for async merges; layout sync so it matches state before queued IDB/fetch work. */
+  const emailsRef = useRef<GmailMessage[]>(DEFAULT_STORAGE);
+  useLayoutEffect(() => {
+    emailsRef.current = emails;
+  }, [emails]);
+
+  /** Serialize IDB hydration + all fetches so nothing reads stale IDB mid-write or overwrites a fuller merge. */
+  const ioChainRef = useRef(Promise.resolve());
+  const enqueue = useCallback((task: () => Promise<void>) => {
+    const next = ioChainRef.current
+      .then(task)
+      .catch((err) => console.warn("useGmailMessages: queued task failed:", err));
+    ioChainRef.current = next;
+    return next;
+  }, []);
+
+  const prevStorageKeyRef = useRef<string | undefined>(undefined);
   useEffect(() => {
-    if (!storageKey || !useLocal) return;
-    if (prevStorageKey.current !== storageKey) {
-      prevStorageKey.current = storageKey;
-      setEmails(loadLegacyLocalStorageSync(storageKey));
-    }
-  }, [storageKey, useLocal]);
-
-  useEffect(() => {
-    if (!storageKey || !useLocal) return;
-    let cancelled = false;
-    (async () => {
-      const fromIdb = await idbGetMonthEmails(storageKey);
-      if (cancelled) return;
-      if (fromIdb && fromIdb.length > 0) {
-        setEmails(fromIdb);
-        try {
-          localStorage.removeItem(storageKey);
-        } catch {
-          /* ignore */
-        }
-        return;
-      }
-      const legacy = loadLegacyLocalStorageSync(storageKey);
-      if (legacy.length) {
-        setEmails(legacy);
-        try {
-          await idbPutMonthEmails(storageKey, legacy.map(stripHeavyFieldsForStorage));
-          localStorage.removeItem(storageKey);
-        } catch (e) {
-          console.warn("useGmailMessages: migrate legacy cache to IndexedDB failed:", e);
-        }
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [storageKey, useLocal]);
-
-  const fetchEmails = useCallback(async () => {
-    if (!from.trim()) {
+    if (!storageKey) return;
+    if (prevStorageKeyRef.current !== undefined && prevStorageKeyRef.current !== storageKey) {
       setEmails([]);
-      if (storageKey) {
-        if (useLocal) {
-          void idbDeleteMonthEmails(storageKey);
+      emailsRef.current = [];
+      if (useLocal) setIsHydratingFromCache(true);
+    }
+    prevStorageKeyRef.current = storageKey;
+  }, [storageKey, useLocal]);
+
+  /** IndexedDB / legacy: merge into state — never replace (avoids clobbering a newer refetch). */
+  useEffect(() => {
+    if (!storageKey || !useLocal) {
+      setIsHydratingFromCache(false);
+      return;
+    }
+    void enqueue(async () => {
+      try {
+        const fromIdb = await idbGetMonthEmails(storageKey);
+        if (fromIdb && fromIdb.length > 0) {
+          setEmails((prev) => {
+            const m = mergeEmailListsById(fromIdb, prev);
+            emailsRef.current = m;
+            return m;
+          });
           try {
             localStorage.removeItem(storageKey);
           } catch {
             /* ignore */
           }
-        } else {
-          getStorage(storageKey, useLocal).removeItem(storageKey);
+          return;
         }
+        const legacy = loadLegacyLocalStorageSync(storageKey);
+        if (legacy.length) {
+          try {
+            await idbPutMonthEmails(storageKey, legacy.map(stripHeavyFieldsForStorage));
+            setEmails((prev) => {
+              const m = mergeEmailListsById(legacy, prev);
+              emailsRef.current = m;
+              return m;
+            });
+            localStorage.removeItem(storageKey);
+          } catch (e) {
+            console.warn("useGmailMessages: migrate legacy cache to IndexedDB failed:", e);
+          }
+        }
+      } finally {
+        setIsHydratingFromCache(false);
       }
-      return;
-    }
-    setLoading(true);
-    setError(null);
-    try {
-      const data = await getGmailMessages({
-        from: from.trim(),
-        subject,
-        newerThanDays,
-        afterDate,
-        beforeDate,
-        maxResults,
-        includeCsv,
+    });
+  }, [storageKey, useLocal, enqueue]);
+
+  /** Session cache: merge on load (sync). */
+  useEffect(() => {
+    if (!storageKey || useLocal) return;
+    const s = loadFromSessionStorage(storageKey);
+    if (s.length) {
+      setEmails((prev) => {
+        const m = mergeEmailListsById(s, prev);
+        emailsRef.current = m;
+        return m;
       });
-      const list = data ?? [];
-      if (storageKey && useLocal) {
-        setEmails((prev) => {
-          const byId = new Map(prev.map((e) => [e.id, e]));
-          for (const e of list) byId.set(e.id, e);
-          const merged = Array.from(byId.values()).sort(
-            (a, b) => (Number(a.internalDate) || 0) - (Number(b.internalDate) || 0)
-          );
-          return persistMessages(storageKey, useLocal, merged);
-        });
-      } else {
-        if (storageKey) {
-          setEmails(persistMessages(storageKey, useLocal, list));
-        } else {
-          setEmails(list);
-        }
-      }
-    } catch (e) {
-      setEmails([]);
-      setError(e instanceof Error ? e.message : "Failed to load emails");
-    } finally {
-      setLoading(false);
     }
-  }, [from, subject, newerThanDays, afterDate, beforeDate, maxResults, includeCsv, storageKey, useLocal]);
+  }, [storageKey, useLocal]);
+
+  const fetchEmails = useCallback(async () => {
+    if (!from.trim()) {
+      return enqueue(async () => {
+        setEmails([]);
+        emailsRef.current = [];
+        if (storageKey) {
+          if (useLocal) {
+            await idbDeleteMonthEmails(storageKey);
+            try {
+              localStorage.removeItem(storageKey);
+            } catch {
+              /* ignore */
+            }
+          } else {
+            getStorage(storageKey, useLocal).removeItem(storageKey);
+          }
+        }
+      });
+    }
+
+    return enqueue(async () => {
+      setLoading(true);
+      setError(null);
+      try {
+        let seed: GmailMessage[] = [];
+        if (storageKey) {
+          if (useLocal) {
+            seed = (await idbGetMonthEmails(storageKey)) ?? [];
+          } else {
+            seed = loadFromSessionStorage(storageKey);
+          }
+        }
+
+        const data = await getGmailMessages({
+          from: from.trim(),
+          subject,
+          newerThanDays,
+          afterDate,
+          beforeDate,
+          maxResults,
+          includeCsv,
+        });
+        const list = data ?? [];
+        const prev = emailsRef.current;
+        const merged = storageKey ? mergeEmailListsById(seed, prev, list) : list;
+
+        if (storageKey && useLocal) {
+          await persistIdb(storageKey, merged);
+        } else if (storageKey && !useLocal) {
+          persistSessionStorage(storageKey, useLocal, merged);
+        }
+        setEmails(merged);
+        emailsRef.current = merged;
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Failed to load emails");
+      } finally {
+        setLoading(false);
+      }
+    });
+  }, [from, subject, newerThanDays, afterDate, beforeDate, maxResults, includeCsv, storageKey, useLocal, enqueue]);
 
   useEffect(() => {
-    if (enabled && from.trim()) fetchEmails();
+    if (enabled && from.trim()) void fetchEmails();
     else if (!storageKey) setEmails([]);
   }, [enabled, fetchEmails, from, storageKey]);
 
   const refetchDateRange = useCallback(
-    async (rangeAfter: string, rangeBefore: string) => {
-      if (!from.trim()) return;
-      setLoading(true);
-      setError(null);
-      try {
-        const data = await getGmailMessages({
-          from: from.trim(),
-          subject,
-          afterDate: rangeAfter,
-          beforeDate: rangeBefore,
-          maxResults,
-          includeCsv,
-        });
-        const newList = data ?? [];
-        setEmails((prev) => {
-          const byId = new Map(prev.map((e) => [e.id, e]));
-          for (const e of newList) byId.set(e.id, e);
-          const merged = Array.from(byId.values()).sort(
-            (a, b) => (Number(a.internalDate) || 0) - (Number(b.internalDate) || 0)
-          );
-          if (storageKey) return persistMessages(storageKey, useLocal, merged);
-          return merged;
-        });
-      } catch (e) {
-        setError(e instanceof Error ? e.message : "Failed to fetch date range");
-      } finally {
-        setLoading(false);
-      }
+    (rangeAfter: string, rangeBefore: string) => {
+      if (!from.trim()) return Promise.resolve();
+      return enqueue(async () => {
+        setLoading(true);
+        setError(null);
+        try {
+          let seed: GmailMessage[] = [];
+          if (storageKey) {
+            if (useLocal) {
+              seed = (await idbGetMonthEmails(storageKey)) ?? [];
+            } else {
+              seed = loadFromSessionStorage(storageKey);
+            }
+          }
+
+          const data = await getGmailMessages({
+            from: from.trim(),
+            subject,
+            afterDate: rangeAfter,
+            beforeDate: rangeBefore,
+            maxResults,
+            includeCsv,
+          });
+          const newList = data ?? [];
+          const prev = emailsRef.current;
+          const merged = storageKey ? mergeEmailListsById(seed, prev, newList) : newList;
+
+          if (storageKey && useLocal) {
+            await persistIdb(storageKey, merged);
+          } else if (storageKey && !useLocal) {
+            persistSessionStorage(storageKey, useLocal, merged);
+          }
+          setEmails(merged);
+          emailsRef.current = merged;
+        } catch (e) {
+          setError(e instanceof Error ? e.message : "Failed to fetch date range");
+        } finally {
+          setLoading(false);
+        }
+      });
     },
-    [from, subject, includeCsv, storageKey, useLocal, maxResults]
+    [from, subject, includeCsv, storageKey, useLocal, maxResults, enqueue]
   );
 
-  return { emails, loading, error, refetch: fetchEmails, refetchDateRange };
+  return { emails, loading, error, refetch: fetchEmails, refetchDateRange, isHydratingFromCache };
 }

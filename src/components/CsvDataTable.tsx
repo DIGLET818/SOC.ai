@@ -3,6 +3,11 @@
  */
 import { useState, useRef, useCallback, useEffect } from "react";
 import {
+  formatClosureDateToIst,
+  formatClosureDateTooltip,
+  looksLikeIsoInstant,
+} from "@/lib/closureDateFormat";
+import {
   Table,
   TableBody,
   TableCell,
@@ -26,17 +31,12 @@ import {
 } from "@/components/ui/select";
 import { Filter, GripVertical } from "lucide-react";
 import { cn } from "@/lib/utils";
-import {
-  formatClosureDateToIst,
-  formatClosureDateTooltip,
-  looksLikeIsoInstant,
-} from "@/lib/closureDateFormat";
 import type { CsvAttachment } from "@/types/gmail";
 
 const DEFAULT_COL_WIDTH = 160;
 const MIN_COL_WIDTH = 80;
 
-const STATUS_OPTIONS = ["Open", "Closed", "In Progress", "Merged", "Incident Auto Closed"];
+const STATUS_OPTIONS = ["Open", "Closed", "In Progress", "Pending", "Merged", "Incident Auto Closed"];
 
 function isStatusHeader(header: string): boolean {
   return header.toLowerCase().replace(/\s/g, "") === "status";
@@ -327,7 +327,7 @@ export function CsvDataTable({
           <TableBody>
             {filteredRows.map((row, idx) => (
               <TableRow
-                key={idx}
+                key={String((row as Record<string, unknown>).__rowIndex ?? idx)}
                 className={cn("hover:bg-muted/20", onRowClick && "cursor-pointer")}
                 onClick={() => onRowClick?.(row)}
               >
@@ -350,7 +350,7 @@ export function CsvDataTable({
                   const closureCommentsValue = isClosureComments
                     ? (closureCommentsOverrides[getRowKey(row)] ?? row[h] ?? "")
                     : "";
-                  const closureDateValue = isClosureDate
+                  const closureDateStored = isClosureDate
                     ? (closureDateOverrides[getRowKey(row)] ?? row[h] ?? "")
                     : "";
                   return (
@@ -364,7 +364,7 @@ export function CsvDataTable({
                           : isClosureComments
                             ? undefined
                             : isClosureDate
-                              ? formatClosureDateTooltip(closureDateValue)
+                              ? formatClosureDateTooltip(closureDateStored)
                               : String(row[h] ?? "")
                       }
                       onClick={
@@ -397,7 +397,7 @@ export function CsvDataTable({
                         />
                       ) : isClosureDate ? (
                         <ClosureDateField
-                          stored={closureDateValue}
+                          stored={closureDateStored}
                           row={row}
                           onClosureDateChange={onClosureDateChange}
                         />

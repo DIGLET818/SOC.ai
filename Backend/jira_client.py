@@ -329,10 +329,96 @@ def list_fields() -> list:
     return out
 
 
+def _issues_from_search_payload(data: dict) -> list:
+    """Parse issues array from Jira search JSON (classic or enhanced JQL)."""
+    issues = []
+    for item in (data or {}).get("issues") or []:
+        key = item.get("key")
+        if not key:
+            continue
+        fields = item.get("fields") or {}
+        summary = (fields.get("summary") or "").strip()
+        status_obj = fields.get("status") or {}
+        status_name = (status_obj.get("name") or "").strip()
+        issues.append({"key": key, "summary": summary, "status": status_name})
+    return issues
+
+
+def _search_issues_jql_enhanced(base_url: str, headers: dict, jql: str, max_results: int) -> list | None:
+    """
+    Jira Cloud enhanced search GET /rest/api/3/search/jql with nextPageToken pagination.
+    Returns None if the endpoint is missing (caller falls back to classic /search).
+    """
+    url = f"{base_url}/rest/api/3/search/jql"
+    collected: list = []
+    next_token = None
+    first_request = True
+    while len(collected) < max_results:
+        batch = min(100, max_results - len(collected))
+        params: dict = {"jql": jql, "maxResults": batch, "fields": "summary,status"}
+        if next_token:
+            params["nextPageToken"] = next_token
+        try:
+            resp = requests.get(url, params=params, headers=headers, timeout=60)
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(f"Jira request failed: {e}") from e
+        if resp.status_code != 200:
+            if first_request and resp.status_code in (404, 405, 410):
+                return None
+            raise RuntimeError(f"Jira API {resp.status_code}: {(resp.text or '')[:400]}")
+        first_request = False
+        try:
+            data = resp.json()
+        except Exception as e:
+            raise RuntimeError(f"Jira search: invalid JSON ({e})") from e
+        collected.extend(_issues_from_search_payload(data))
+        if data.get("isLast"):
+            break
+        next_token = data.get("nextPageToken")
+        if not next_token or (isinstance(next_token, str) and not next_token.strip()):
+            break
+    return collected
+
+
+def _search_issues_classic(base_url: str, headers: dict, jql: str, max_results: int) -> list:
+    """Legacy GET /rest/api/3/search or /rest/api/2/search with startAt pagination (Jira Server / older Cloud)."""
+    collected: list = []
+    for api_ver in ("3", "2"):
+        url = f"{base_url}/rest/api/{api_ver}/search"
+        start_at = 0
+        while len(collected) < max_results:
+            batch = min(50, max_results - len(collected))
+            params = {"jql": jql, "startAt": start_at, "maxResults": batch, "fields": "summary,status"}
+            try:
+                resp = requests.get(url, params=params, headers=headers, timeout=60)
+            except requests.exceptions.RequestException as e:
+                raise RuntimeError(f"Jira request failed: {e}") from e
+            if not resp.ok:
+                break
+            try:
+                data = resp.json()
+            except Exception:
+                break
+            page = _issues_from_search_payload(data)
+            if not page:
+                return collected
+            collected.extend(page)
+            total = int(data.get("total") or 0)
+            start_at += len(page)
+            if start_at >= total or len(page) < batch:
+                return collected
+        if collected:
+            return collected
+    raise RuntimeError(
+        "Jira search failed: no working search endpoint (tried /rest/api/3/search/jql and /rest/api/3|2/search)."
+    )
+
+
 def search_issues(max_results: int = 200) -> list:
     """
     Search Jira for issues in the configured project. Returns list of { "key": "SOC-1", "summary": "...", "status": "..." }.
     Used to link existing Jira tickets to alerts by matching summary to incident/servicenow.
+    Uses enhanced JQL search with pagination when available; falls back to classic /search.
     """
     base_url = _env("JIRA_BASE_URL").rstrip("/")
     email = _env("JIRA_EMAIL")
@@ -345,23 +431,11 @@ def search_issues(max_results: int = 200) -> list:
     auth = base64.b64encode(f"{email}:{api_token}".encode()).decode()
     headers = _get_headers(auth)
     jql = f"project = {project_key} ORDER BY created DESC"
-    url = f"{base_url}/rest/api/3/search/jql"
-    params = {"jql": jql, "maxResults": min(max_results, 500), "fields": "summary,status"}
-    try:
-        resp = requests.get(url, params=params, headers=headers, timeout=30)
-    except requests.exceptions.RequestException as e:
-        raise RuntimeError(f"Jira request failed: {e}") from e
-    if not resp.ok:
-        raise RuntimeError(f"Jira API {resp.status_code}: {resp.text[:200]}")
-    data = resp.json()
-    issues = []
-    for item in data.get("issues") or []:
-        key = item.get("key")
-        if not key:
-            continue
-        fields = item.get("fields") or {}
-        summary = (fields.get("summary") or "").strip()
-        status_obj = fields.get("status") or {}
-        status_name = (status_obj.get("name") or "").strip()
-        issues.append({"key": key, "summary": summary, "status": status_name})
-    return issues
+    cap = min(max(1, int(max_results)), 2000)
+
+    enhanced = _search_issues_jql_enhanced(base_url, headers, jql, cap)
+    if enhanced is not None:
+        return enhanced[:cap]
+
+    classic = _search_issues_classic(base_url, headers, jql, cap)
+    return classic[:cap]

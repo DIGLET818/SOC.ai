@@ -1,4 +1,5 @@
-import { useMemo, useState, useCallback, useEffect } from "react";
+import { useMemo, useState, useCallback, useEffect, useLayoutEffect } from "react";
+import { format } from "date-fns";
 import { SidebarProvider, SidebarInset } from "@/components/ui/sidebar";
 import { SOCSidebar } from "@/components/SOCSidebar";
 import { ThemeToggle } from "@/components/ThemeToggle";
@@ -7,6 +8,7 @@ import { CsvDataTable } from "@/components/CsvDataTable";
 import { EmailDetailSheet } from "@/components/EmailDetailSheet";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { Calendar } from "@/components/ui/calendar";
 import {
   Select,
   SelectContent,
@@ -14,17 +16,30 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { RefreshCw, ChevronLeft, ChevronRight, Calendar, FileText } from "lucide-react";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { RefreshCw, ChevronLeft, ChevronRight, Calendar as CalendarIcon, FileText, DatabaseZap } from "lucide-react";
 import { API_BASE_URL } from "@/api/client";
-import { useGmailMessages } from "@/hooks/useGmailMessages";
+import { useDailyAlertsData } from "@/hooks/useDailyAlertsData";
+import {
+  upsertDailyOverride,
+  importDailyOverrides,
+  syncDailyAlerts,
+  getDailyAlerts,
+  type DailyOverrideRecord,
+} from "@/api/dailyAlerts";
+import { importJiraTickets } from "@/api/jiraTickets";
+import {
+  collectLegacyMigrationCandidates,
+  hasLegacyDailyAlertsData,
+  clearLegacyDailyAlertsLocalStorage,
+  extractLegacyMonths,
+  monthDateRange,
+} from "@/lib/legacyDailyAlertsMigration";
 import { getGmailMessageBySearch } from "@/api/gmail";
 import { toast } from "@/hooks/use-toast";
 import type { GmailMessage } from "@/types/gmail";
 
 const DAILY_ALERTS_SENDER = "PB_daily@global.ntt";
-const DAILY_ALERTS_SUBJECT = "PB Daily report";
-const STATUS_OVERRIDES_KEY = "sentinel_daily_alerts_status_overrides";
-const CLOSURE_COMMENTS_OVERRIDES_KEY = "sentinel_daily_alerts_closure_comments_overrides";
 
 function getMonthRange(year: number, month: number): { afterDate: string; beforeDate: string } {
   const after = new Date(year, month - 1, 1);
@@ -47,24 +62,28 @@ function nextDay(dateStr: string): string {
   return toYYYYMMDD(d);
 }
 
-function loadStatusOverrides(): Record<string, string> {
-  try {
-    const s = localStorage.getItem(STATUS_OVERRIDES_KEY);
-    if (s) return JSON.parse(s) as Record<string, string>;
-  } catch {
-    /* ignore */
-  }
-  return {};
+/** Stable per-row DB key: `${messageId}-r${rowIndex}` -- mirrors the server. */
+function dbRowKey(messageId: string, rowIndex: number): string {
+  return `${messageId}-r${rowIndex}`;
 }
 
-function loadClosureCommentsOverrides(): Record<string, string> {
-  try {
-    const s = localStorage.getItem(CLOSURE_COMMENTS_OVERRIDES_KEY);
-    if (s) return JSON.parse(s) as Record<string, string>;
-  } catch {
-    /* ignore */
+/**
+ * Collapse the structured override records the server returns into the
+ * legacy `Record<string, string>` shape that CsvDataTable expects.
+ */
+function flattenOverrides(
+  overrides: Record<string, DailyOverrideRecord>
+): {
+  status: Record<string, string>;
+  closureComment: Record<string, string>;
+} {
+  const status: Record<string, string> = {};
+  const closureComment: Record<string, string> = {};
+  for (const [key, rec] of Object.entries(overrides)) {
+    if (rec.status) status[key] = rec.status;
+    if (rec.closure_comment) closureComment[key] = rec.closure_comment;
   }
-  return {};
+  return { status, closureComment };
 }
 
 function parseEmailDate(email: GmailMessage): number {
@@ -90,6 +109,19 @@ function formatReportDate(email: GmailMessage): string {
   });
 }
 
+/** Local calendar YYYY-MM-DD for an email (for matching DayPicker selection). */
+function emailCalendarDateKey(email: GmailMessage): string {
+  const ts = parseEmailDate(email);
+  const d = new Date(ts);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+function parseISODateLocal(ymd: string): Date {
+  const [y, m, d] = ymd.split("-").map(Number);
+  return new Date(y, m - 1, d);
+}
+
 /** Find row value by header key (case-insensitive match). */
 function getRowValue(row: Record<string, string>, ...possibleKeys: string[]): string {
   const keys = Object.keys(row);
@@ -101,7 +133,7 @@ function getRowValue(row: Record<string, string>, ...possibleKeys: string[]): st
 }
 
 /** Status values we count (must match CsvDataTable STATUS_OPTIONS). */
-const STATUS_COUNTS = ["Open", "Closed", "In Progress", "Merged", "Incident Auto Closed"] as const;
+const STATUS_COUNTS = ["Open", "Closed", "In Progress", "Pending", "Merged", "Incident Auto Closed"] as const;
 
 function normalizeStatus(s: string): (typeof STATUS_COUNTS)[number] {
   const t = s.trim();
@@ -113,12 +145,10 @@ function normalizeStatus(s: string): (typeof STATUS_COUNTS)[number] {
 function getRowStatus(
   row: Record<string, string>,
   headers: string[],
-  emailId: string,
-  getRowKey: (row: Record<string, string>) => string,
+  rowKey: string,
   statusOverrides: Record<string, string>
 ): string {
-  const key = getRowKey(row);
-  if (statusOverrides[key]?.trim()) return statusOverrides[key].trim();
+  if (statusOverrides[rowKey]?.trim()) return statusOverrides[rowKey].trim();
   const statusHeader = headers.find((h) => h.toLowerCase().replace(/\s/g, "") === "status");
   const raw = statusHeader ? row[statusHeader]?.trim() : "";
   return raw || "Open";
@@ -128,15 +158,35 @@ function countByStatus(
   rows: Record<string, string>[],
   headers: string[],
   emailId: string,
-  getRowKey: (row: Record<string, string>) => string,
   statusOverrides: Record<string, string>
-): { total: number; open: number; closed: number; inProgress: number; merged: number; incidentAutoClosed: number } {
-  const counts = { total: rows.length, open: 0, closed: 0, inProgress: 0, merged: 0, incidentAutoClosed: 0 };
-  for (const row of rows) {
-    const s = normalizeStatus(getRowStatus(row, headers, emailId, getRowKey, statusOverrides));
+): {
+  total: number;
+  open: number;
+  closed: number;
+  inProgress: number;
+  pending: number;
+  merged: number;
+  incidentAutoClosed: number;
+} {
+  const counts = {
+    total: rows.length,
+    open: 0,
+    closed: 0,
+    inProgress: 0,
+    pending: 0,
+    merged: 0,
+    incidentAutoClosed: 0,
+  };
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    const explicit = Number((row as Record<string, unknown>).__rowIndex);
+    const idx = Number.isFinite(explicit) ? explicit : i;
+    const key = dbRowKey(emailId, idx);
+    const s = normalizeStatus(getRowStatus(row, headers, key, statusOverrides));
     if (s === "Open") counts.open++;
     else if (s === "Closed") counts.closed++;
     else if (s === "In Progress") counts.inProgress++;
+    else if (s === "Pending") counts.pending++;
     else if (s === "Merged") counts.merged++;
     else if (s === "Incident Auto Closed") counts.incidentAutoClosed++;
     else counts.open++;
@@ -161,36 +211,39 @@ for (let i = 0; i < 12; i++) {
 export default function DailyAlerts() {
   const [selectedYear, setSelectedYear] = useState(currentYear);
   const [selectedMonth, setSelectedMonth] = useState(currentMonth);
-  const [statusOverrides, setStatusOverrides] = useState<Record<string, string>>(() => loadStatusOverrides());
-  const [closureCommentsOverrides, setClosureCommentsOverrides] = useState<Record<string, string>>(() => loadClosureCommentsOverrides());
 
   const { afterDate, beforeDate } = useMemo(
     () => getMonthRange(selectedYear, selectedMonth),
     [selectedYear, selectedMonth]
   );
 
-  const storageKey = useMemo(
-    () => `sentinel_daily_alerts_emails_${selectedYear}_${selectedMonth}`,
-    [selectedYear, selectedMonth]
-  );
-
   const {
     emails,
+    overrides: serverOverrides,
     loading,
+    syncing,
     error,
-    refetch,
+    currentUser,
+    refetchFromGmail: refetch,
     refetchDateRange,
-  } = useGmailMessages({
-    from: DAILY_ALERTS_SENDER,
-    subject: DAILY_ALERTS_SUBJECT,
+    setLocalOverride,
+    reload,
+  } = useDailyAlertsData({
     afterDate,
     beforeDate,
-    maxResults: 100,
-    enabled: false,
-    includeCsv: true,
-    storageKey,
-    persistInLocalStorage: true,
+    maxResults: 2000,
   });
+
+  const isAnonymous = currentUser === "anonymous";
+
+  /** Flatten server records to the legacy map shape CsvDataTable expects. */
+  const { statusOverrides, closureCommentsOverrides } = useMemo(() => {
+    const flat = flattenOverrides(serverOverrides);
+    return {
+      statusOverrides: flat.status,
+      closureCommentsOverrides: flat.closureComment,
+    };
+  }, [serverOverrides]);
 
   const emailsSortedByDate = useMemo(() => {
     return [...emails].sort((a, b) => parseEmailDate(a) - parseEmailDate(b));
@@ -201,11 +254,14 @@ export default function DailyAlerts() {
     [emailsSortedByDate]
   );
 
-  const getRowKey = useCallback((emailId: string) => (row: Record<string, string>) => {
-    const inc = getRowValue(row, "IncidentID", "Incident ID");
-    const sn = getRowValue(row, "ServicenowTicket", "ServiceNow Ticket", "ServicenowT");
-    return `${emailId}-${inc || "n/a"}-${sn || "n/a"}`;
-  }, []);
+  const getRowKey = useCallback(
+    (emailId: string) => (row: Record<string, string>) => {
+      const explicit = Number((row as Record<string, unknown>).__rowIndex);
+      if (!Number.isFinite(explicit)) return "";
+      return dbRowKey(emailId, explicit);
+    },
+    []
+  );
 
   const [fetchDate, setFetchDate] = useState<string>(() => toYYYYMMDD(new Date()));
   const fetchDateMin = useMemo(() => afterDate, [afterDate]);
@@ -235,68 +291,230 @@ export default function DailyAlerts() {
     setFetchDate(fetchDateForMonth);
   }, [selectedYear, selectedMonth, fetchDateForMonth]);
 
+  const reportListSignature = useMemo(() => emailsWithCsv.map((e) => e.id).join(","), [emailsWithCsv]);
+  const reportDateSet = useMemo(() => {
+    const s = new Set<string>();
+    for (const e of emailsWithCsv) s.add(emailCalendarDateKey(e));
+    return s;
+  }, [emailsWithCsv]);
+
   const [selectedReportIndex, setSelectedReportIndex] = useState(0);
+  const [reportCalendarOpen, setReportCalendarOpen] = useState(false);
+  const [calendarMonth, setCalendarMonth] = useState(() => new Date(selectedYear, selectedMonth - 1, 1));
+
+  useEffect(() => {
+    setCalendarMonth(new Date(selectedYear, selectedMonth - 1, 1));
+  }, [selectedYear, selectedMonth]);
+
+  /**
+   * Default to the latest report on context change. We don't try to remember
+   * "last viewed report" across reloads anymore -- the DB has all the data,
+   * so always opening on the most recent day is the principled default.
+   */
+  useLayoutEffect(() => {
+    if (emailsWithCsv.length === 0) return;
+    setSelectedReportIndex(emailsWithCsv.length - 1);
+  }, [selectedYear, selectedMonth, reportListSignature]);
+
   const safeReportIndex =
     emailsWithCsv.length > 0 ? Math.min(selectedReportIndex, emailsWithCsv.length - 1) : 0;
   const selectedEmail = emailsWithCsv[safeReportIndex] ?? null;
 
-  useEffect(() => {
-    if (emailsWithCsv.length > 0 && selectedReportIndex > emailsWithCsv.length - 1) {
-      setSelectedReportIndex(emailsWithCsv.length - 1);
-    }
-  }, [emailsWithCsv.length, selectedReportIndex]);
+  const selectedReportDate = useMemo(() => {
+    if (!selectedEmail) return undefined;
+    return parseISODateLocal(emailCalendarDateKey(selectedEmail));
+  }, [selectedEmail]);
+
+  const handleReportCalendarSelect = useCallback(
+    (d: Date | undefined) => {
+      if (!d) return;
+      const key = toYYYYMMDD(d);
+      const matches = emailsWithCsv.filter((e) => emailCalendarDateKey(e) === key);
+      if (matches.length === 0) {
+        toast({ title: "No report", description: `No daily CSV loaded for ${key}.`, variant: "destructive" });
+        return;
+      }
+      const last = matches[matches.length - 1];
+      const idx = emailsWithCsv.findIndex((e) => e.id === last.id);
+      if (idx >= 0) setSelectedReportIndex(idx);
+      setReportCalendarOpen(false);
+    },
+    [emailsWithCsv]
+  );
 
   const monthStats = useMemo(() => {
     let total = 0;
-    const counts = { open: 0, closed: 0, inProgress: 0, merged: 0, incidentAutoClosed: 0 };
+    const counts = { open: 0, closed: 0, inProgress: 0, pending: 0, merged: 0, incidentAutoClosed: 0 };
     for (const email of emailsWithCsv) {
       const csv = email.csvAttachment;
       if (!csv?.headers?.length || !csv.rows?.length) continue;
-      const c = countByStatus(csv.rows, csv.headers, email.id, getRowKey(email.id), statusOverrides);
+      const c = countByStatus(csv.rows, csv.headers, email.id, statusOverrides);
       total += c.total;
       counts.open += c.open;
       counts.closed += c.closed;
       counts.inProgress += c.inProgress;
+      counts.pending += c.pending;
       counts.merged += c.merged;
       counts.incidentAutoClosed += c.incidentAutoClosed;
     }
     return { total, ...counts };
-  }, [emailsWithCsv, statusOverrides, getRowKey]);
+  }, [emailsWithCsv, statusOverrides]);
 
   const selectedDateStats = useMemo(() => {
-    if (!selectedEmail?.csvAttachment) return { total: 0, open: 0, closed: 0, inProgress: 0, merged: 0, incidentAutoClosed: 0 };
+    if (!selectedEmail?.csvAttachment) {
+      return { total: 0, open: 0, closed: 0, inProgress: 0, pending: 0, merged: 0, incidentAutoClosed: 0 };
+    }
     const { headers, rows } = selectedEmail.csvAttachment;
-    return countByStatus(rows, headers, selectedEmail.id, getRowKey(selectedEmail.id), statusOverrides);
-  }, [selectedEmail, statusOverrides, getRowKey]);
+    return countByStatus(rows, headers, selectedEmail.id, statusOverrides);
+  }, [selectedEmail, statusOverrides]);
 
   const [trailEmail, setTrailEmail] = useState<GmailMessage | null>(null);
   const [trailLoading, setTrailLoading] = useState(false);
 
-  const handleStatusChange = useCallback((row: Record<string, string>, newStatus: string, emailId: string) => {
-    const key = getRowKey(emailId)(row);
-    setStatusOverrides((prev) => {
-      const next = { ...prev, [key]: newStatus };
+  /**
+   * Persist a single override: optimistically update local state, then PATCH
+   * the server. On server failure we surface a toast but keep the optimistic
+   * update so the analyst doesn't lose their keystrokes.
+   */
+  const persistOverride = useCallback(
+    async (
+      messageId: string,
+      rowIndex: number,
+      field: "status" | "closure_comment" | "closure_date",
+      value: string
+    ) => {
+      const actor = currentUser && currentUser !== "anonymous" ? { email: currentUser.email } : undefined;
+      setLocalOverride(messageId, rowIndex, field, value, actor);
       try {
-        localStorage.setItem(STATUS_OVERRIDES_KEY, JSON.stringify(next));
-      } catch {
-        /* ignore */
+        await upsertDailyOverride({ messageId, rowIndex, field, value });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "Failed to save override";
+        toast({
+          title: "Save failed (server)",
+          description: `${msg}. Your edit is visible locally; refresh to retry.`,
+          variant: "destructive",
+        });
       }
-      return next;
-    });
-  }, [getRowKey]);
+    },
+    [currentUser, setLocalOverride]
+  );
 
-  const handleClosureCommentsChange = useCallback((row: Record<string, string>, newValue: string, emailId: string) => {
-    const key = getRowKey(emailId)(row);
-    setClosureCommentsOverrides((prev) => {
-      const next = { ...prev, [key]: newValue };
-      try {
-        localStorage.setItem(CLOSURE_COMMENTS_OVERRIDES_KEY, JSON.stringify(next));
-      } catch {
-        /* ignore */
+  const handleStatusChange = useCallback(
+    (row: Record<string, string>, newStatus: string, emailId: string) => {
+      const explicit = Number((row as Record<string, unknown>).__rowIndex);
+      if (!Number.isFinite(explicit)) return;
+      void persistOverride(emailId, explicit, "status", newStatus);
+    },
+    [persistOverride]
+  );
+
+  const handleClosureCommentsChange = useCallback(
+    (row: Record<string, string>, newValue: string, emailId: string) => {
+      const explicit = Number((row as Record<string, unknown>).__rowIndex);
+      if (!Number.isFinite(explicit)) return;
+      void persistOverride(emailId, explicit, "closure_comment", newValue);
+    },
+    [persistOverride]
+  );
+
+  /** Migration banner state -- one-shot import of legacy localStorage data. */
+  const [legacyDataPresent, setLegacyDataPresent] = useState<boolean>(() => hasLegacyDailyAlertsData());
+  const [importing, setImporting] = useState(false);
+  const [importStage, setImportStage] = useState<string>("");
+
+  const handleImportLegacy = useCallback(async () => {
+    setImporting(true);
+    setImportStage("");
+    try {
+      // 1. Determine which months our legacy keys reference. Most are
+      //    date-scoped (`YYYY-MM-DD-${inc}-${sn}`), so we sync only those
+      //    months instead of the entire mailbox.
+      const months = extractLegacyMonths();
+      const seenIds = new Set<string>();
+      const allEmails: GmailMessage[] = [];
+      const pushUnique = (list: GmailMessage[]) => {
+        for (const e of list) {
+          if (e?.id && !seenIds.has(e.id)) {
+            seenIds.add(e.id);
+            allEmails.push(e);
+          }
+        }
+      };
+      pushUnique(emails); // currently visible month included by default
+
+      for (let i = 0; i < months.length; i++) {
+        const ym = months[i];
+        const range = monthDateRange(ym);
+        if (!range) continue;
+        setImportStage(`Syncing ${ym} (${i + 1}/${months.length})…`);
+        try {
+          await syncDailyAlerts({ afterDate: range.afterDate, beforeDate: range.beforeDate });
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.warn(`[DailyAlerts import] sync failed for ${ym}:`, err);
+        }
+        try {
+          const data = await getDailyAlerts({ afterDate: range.afterDate, beforeDate: range.beforeDate });
+          pushUnique(data.emails ?? []);
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.warn(`[DailyAlerts import] load failed for ${ym}:`, err);
+        }
       }
-      return next;
-    });
-  }, [getRowKey]);
+
+      setImportStage("Matching legacy edits to rows…");
+      const candidates = collectLegacyMigrationCandidates(allEmails);
+      const totals = candidates.legacyEntryCounts;
+      const totalLocal = totals.status + totals.closureComment + totals.closureDate + totals.jira;
+
+      let importedOverrides = 0;
+      let importedJira = 0;
+      if (candidates.overrides.length > 0) {
+        setImportStage(`Uploading ${candidates.overrides.length} edits…`);
+        const r = await importDailyOverrides(candidates.overrides);
+        importedOverrides = r.imported;
+      }
+      if (candidates.jiraTickets.length > 0) {
+        setImportStage(`Uploading ${candidates.jiraTickets.length} Jira mappings…`);
+        const r = await importJiraTickets(candidates.jiraTickets);
+        importedJira = r.imported;
+      }
+      setImportStage("Reloading current month…");
+      await reload();
+
+      const matched = candidates.overrides.length + candidates.jiraTickets.length;
+      const unmatched = candidates.unmatchedKeys.length;
+      const description =
+        `Imported ${importedOverrides} edits and ${importedJira} Jira mappings into the database.` +
+        (unmatched > 0
+          ? ` ${unmatched} legacy entries still didn't match any synced report -- they may belong to deleted Gmail messages or to months outside your sync history.`
+          : ` All ${totalLocal} legacy entries are now in the database.`) +
+        ` (${matched} candidates considered, ${months.length} month(s) synced, ${allEmails.length} email(s) scanned.)`;
+      toast({ title: "Import complete", description });
+
+      if (matched === 0 && totalLocal > 0) {
+        // eslint-disable-next-line no-console
+        console.warn("[DailyAlerts import] 0 matches against", candidates.diagnostics.rowsLoaded, "loaded rows after sync.", {
+          monthsSynced: months,
+          emailsScanned: allEmails.length,
+          sampleLegacyKeys: candidates.diagnostics.sampleLegacyKeys,
+          sampleParsed: candidates.diagnostics.sampleParsed,
+          sampleRowIdentities: candidates.diagnostics.sampleRowIdentities,
+        });
+      }
+
+      if (unmatched === 0) {
+        clearLegacyDailyAlertsLocalStorage();
+        setLegacyDataPresent(false);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Import failed";
+      toast({ title: "Import failed", description: msg, variant: "destructive" });
+    } finally {
+      setImporting(false);
+      setImportStage("");
+    }
+  }, [emails, reload]);
 
   const handleAlertRowClick = useCallback(async (row: Record<string, string>) => {
     const servicenowTicket = getRowValue(row, "ServicenowTicket", "ServiceNow Ticket", "ServicenowT");
@@ -312,10 +530,10 @@ export default function DailyAlerts() {
     try {
       let email: GmailMessage | null = null;
       if (searchFirst) {
-        email = await getGmailMessageBySearch({ q: searchFirst, newerThanDays: 30 });
+        email = await getGmailMessageBySearch({ q: searchFirst });
       }
       if (!email && searchFallback) {
-        email = await getGmailMessageBySearch({ q: searchFallback, newerThanDays: 30 });
+        email = await getGmailMessageBySearch({ q: searchFallback });
       }
       if (email) {
         setTrailEmail(email);
@@ -393,9 +611,9 @@ export default function DailyAlerts() {
                   <ChevronRight className="h-4 w-4" />
                 </Button>
               </div>
-              <Button variant="outline" size="sm" onClick={refetch} disabled={loading} className="shrink-0">
-                <RefreshCw className={`h-4 w-4 mr-2 ${loading ? "animate-spin" : ""}`} />
-                Refresh
+              <Button variant="outline" size="sm" onClick={() => refetch()} disabled={loading || syncing} className="shrink-0">
+                <RefreshCw className={`h-4 w-4 mr-2 ${syncing ? "animate-spin" : ""}`} />
+                {syncing ? "Syncing…" : "Refresh"}
               </Button>
               <div className="flex items-center gap-2 shrink-0 border-l border-border pl-4">
                 <span className="text-sm text-muted-foreground hidden sm:inline">Fetch date</span>
@@ -407,8 +625,8 @@ export default function DailyAlerts() {
                   value={fetchDate}
                   onChange={(e) => setFetchDate(e.target.value)}
                 />
-                <Button variant="outline" size="sm" onClick={handleFetchThisDate} disabled={loading} className="shrink-0">
-                  <RefreshCw className={`h-3.5 w-3.5 mr-1.5 ${loading ? "animate-spin" : ""}`} />
+                <Button variant="outline" size="sm" onClick={handleFetchThisDate} disabled={loading || syncing} className="shrink-0">
+                  <RefreshCw className={`h-3.5 w-3.5 mr-1.5 ${syncing ? "animate-spin" : ""}`} />
                   Fetch this date
                 </Button>
               </div>
@@ -425,89 +643,171 @@ export default function DailyAlerts() {
             </div>
           </header>
 
-          {!loading && emailsWithCsv.length > 0 && (
-            <div className="shrink-0 border-b border-border bg-background px-6 py-2 shadow-sm">
-              <div className="flex flex-wrap items-center gap-3 mb-2">
-                <span className="text-sm font-medium text-muted-foreground">Report date</span>
-                <div className="flex items-center gap-0.5 rounded-md border border-input bg-background">
+          {legacyDataPresent && !isAnonymous && (
+            <div className="shrink-0 border-b border-amber-500/40 bg-amber-500/10 px-6 py-3">
+              <div className="flex items-start gap-3">
+                <DatabaseZap className="h-5 w-5 mt-0.5 text-amber-600 dark:text-amber-300 shrink-0" />
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm font-semibold text-amber-700 dark:text-amber-200">
+                    Legacy edits detected in this browser.
+                  </p>
+                  <p className="text-xs text-amber-700/80 dark:text-amber-200/80 mt-0.5">
+                    Status and closure-comment edits you saved before the database migration are still in localStorage. Click Import to push them into the database so they survive refreshes, restarts, and other browsers. The importer will automatically sync every month referenced by your local edits before matching, so you only have to click once -- it may take a minute if you have many months of history.
+                  </p>
+                  {importing && importStage && (
+                    <p className="text-xs text-amber-700 dark:text-amber-200 mt-1 font-medium">
+                      {importStage}
+                    </p>
+                  )}
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
                   <Button
-                    variant="ghost"
-                    size="icon"
-                    className="h-8 w-8 shrink-0"
-                    disabled={emailsWithCsv.length <= 1 || safeReportIndex <= 0}
-                    onClick={() => setSelectedReportIndex((i) => Math.max(0, i - 1))}
-                    title="Previous date"
+                    size="sm"
+                    variant="default"
+                    onClick={handleImportLegacy}
+                    disabled={importing}
                   >
-                    <ChevronLeft className="h-3.5 w-3.5" />
+                    {importing ? (importStage || "Importing…") : "Import local edits + Jira tickets"}
                   </Button>
-                  <Select
-                    value={selectedEmail?.id ?? ""}
-                    onValueChange={(id) => {
-                      const idx = emailsWithCsv.findIndex((e) => e.id === id);
-                      if (idx >= 0) setSelectedReportIndex(idx);
-                    }}
-                  >
-                    <SelectTrigger className="h-8 w-[16rem] border-0 bg-transparent shadow-none focus:ring-0 text-sm">
-                      <SelectValue placeholder="Select date" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {emailsWithCsv.map((email) => (
-                        <SelectItem key={email.id} value={email.id}>
-                          {formatReportDate(email)}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
                   <Button
+                    size="sm"
                     variant="ghost"
-                    size="icon"
-                    className="h-8 w-8 shrink-0"
-                    disabled={emailsWithCsv.length <= 1 || safeReportIndex >= emailsWithCsv.length - 1}
-                    onClick={() => setSelectedReportIndex((i) => Math.min(emailsWithCsv.length - 1, i + 1))}
-                    title="Next date"
+                    onClick={() => {
+                      clearLegacyDailyAlertsLocalStorage();
+                      setLegacyDataPresent(false);
+                      toast({ title: "Dismissed", description: "Local edits cleared from this browser." });
+                    }}
+                    disabled={importing}
                   >
-                    <ChevronRight className="h-3.5 w-3.5" />
+                    Dismiss
                   </Button>
                 </div>
               </div>
-              <div className="grid grid-cols-1 lg:grid-cols-2 gap-2">
-                <Card className="border border-border shadow-sm bg-primary/5">
-                  <CardContent className="p-2">
-                    <div className="flex items-center gap-1.5 mb-1">
-                      <Calendar className="h-4 w-4 text-primary shrink-0" />
+            </div>
+          )}
+
+          {!loading && emailsWithCsv.length > 0 && (
+            <div className="shrink-0 border-b border-border bg-background px-6 py-4 shadow-sm space-y-4">
+              <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+                <span className="text-sm font-medium text-muted-foreground shrink-0">Report date</span>
+                <div className="flex items-center gap-1 rounded-lg border border-input bg-background">
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-9 w-9 shrink-0"
+                    disabled={emailsWithCsv.length <= 1 || safeReportIndex <= 0}
+                    onClick={() => setSelectedReportIndex((i) => Math.max(0, i - 1))}
+                    title="Previous report"
+                  >
+                    <ChevronLeft className="h-4 w-4" />
+                  </Button>
+                  <Popover open={reportCalendarOpen} onOpenChange={setReportCalendarOpen}>
+                    <PopoverTrigger asChild>
+                      <Button
+                        variant="ghost"
+                        className="h-9 min-w-[12rem] max-w-[min(100vw-10rem,22rem)] justify-start gap-2 px-3 font-normal text-sm"
+                        title="Pick a day with a loaded report"
+                      >
+                        <CalendarIcon className="h-4 w-4 shrink-0 opacity-70" />
+                        <span className="truncate">
+                          {selectedEmail
+                            ? format(selectedReportDate ?? new Date(), "EEE, MMM d, yyyy")
+                            : "Select date"}
+                        </span>
+                      </Button>
+                    </PopoverTrigger>
+                    <PopoverContent className="w-auto p-0" align="start">
+                      <Calendar
+                        mode="single"
+                        month={calendarMonth}
+                        onMonthChange={setCalendarMonth}
+                        selected={selectedReportDate}
+                        onSelect={handleReportCalendarSelect}
+                        fromDate={parseISODateLocal(afterDate)}
+                        toDate={parseISODateLocal(fetchDateMax)}
+                        disabled={(date) => {
+                          const k = toYYYYMMDD(date);
+                          return k < afterDate || k > fetchDateMax || !reportDateSet.has(k);
+                        }}
+                        modifiers={{ hasReport: (date) => reportDateSet.has(toYYYYMMDD(date)) }}
+                        modifiersClassNames={{
+                          hasReport: "font-semibold text-primary underline decoration-primary/40 decoration-1 underline-offset-2",
+                        }}
+                        initialFocus
+                      />
+                    </PopoverContent>
+                  </Popover>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-9 w-9 shrink-0"
+                    disabled={emailsWithCsv.length <= 1 || safeReportIndex >= emailsWithCsv.length - 1}
+                    onClick={() => setSelectedReportIndex((i) => Math.min(emailsWithCsv.length - 1, i + 1))}
+                    title="Next report"
+                  >
+                    <ChevronRight className="h-4 w-4" />
+                  </Button>
+                </div>
+                {selectedEmail ? (
+                  <span className="text-xs text-muted-foreground tabular-nums">{formatReportDate(selectedEmail)}</span>
+                ) : null}
+              </div>
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                <Card className="border border-border/80 shadow-sm bg-primary/5 rounded-xl">
+                  <CardContent className="p-4 sm:p-5">
+                    <div className="flex items-center gap-2 mb-3">
+                      <CalendarIcon className="h-5 w-5 text-primary shrink-0" />
                       <p className="text-xs font-semibold text-primary uppercase tracking-wide">Month data</p>
                     </div>
-                    <p className="text-lg font-bold text-foreground mb-1">Total: {monthStats.total} alerts</p>
-                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-x-2 gap-y-0.5 text-xs">
-                      <span className="text-muted-foreground">Open:</span>
-                      <span className="font-medium text-foreground">{monthStats.open}</span>
-                      <span className="text-muted-foreground">Closed:</span>
-                      <span className="font-medium text-foreground">{monthStats.closed}</span>
-                      <span className="text-muted-foreground">Pending:</span>
-                      <span className="font-medium text-foreground">{monthStats.inProgress}</span>
-                      <span className="text-muted-foreground">Incident Auto Closed:</span>
-                      <span className="font-medium text-foreground">{monthStats.incidentAutoClosed}</span>
-                    </div>
+                    <p className="text-xl font-bold text-foreground mb-4 tabular-nums">{monthStats.total} alerts</p>
+                    <dl className="grid grid-cols-1 sm:grid-cols-2 gap-x-8 gap-y-3 text-sm">
+                      {(
+                        [
+                          ["Open", monthStats.open],
+                          ["Closed", monthStats.closed],
+                          ["Merged", monthStats.merged],
+                          ["Confirmation pending from End user", monthStats.pending],
+                          ["In progress", monthStats.inProgress],
+                          ["Incident auto closed", monthStats.incidentAutoClosed],
+                        ] as const
+                      ).map(([label, val]) => (
+                        <div key={label} className="flex items-baseline justify-between gap-4 min-w-0">
+                          <dt className="text-muted-foreground leading-snug">{label}</dt>
+                          <dd className="font-semibold tabular-nums text-foreground shrink-0">{val}</dd>
+                        </div>
+                      ))}
+                    </dl>
                   </CardContent>
                 </Card>
-                <Card className="border border-border shadow-sm bg-blue-500/5">
-                  <CardContent className="p-2">
-                    <div className="flex items-center gap-1.5 mb-1">
-                      <FileText className="h-4 w-4 text-blue-600 dark:text-blue-400 shrink-0" />
-                      <p className="text-xs font-semibold text-blue-700 dark:text-blue-300 uppercase tracking-wide">This date</p>
+                <Card className="border border-border/80 shadow-sm bg-blue-500/5 rounded-xl">
+                  <CardContent className="p-4 sm:p-5">
+                    <div className="flex items-center gap-2 mb-2">
+                      <FileText className="h-5 w-5 text-blue-600 dark:text-blue-400 shrink-0" />
+                      <p className="text-xs font-semibold text-blue-700 dark:text-blue-300 uppercase tracking-wide">
+                        Report date
+                      </p>
                     </div>
-                    <p className="text-[10px] text-muted-foreground truncate mb-0.5">{selectedEmail ? formatReportDate(selectedEmail) : "—"}</p>
-                    <p className="text-lg font-bold text-foreground mb-1">Total: {selectedDateStats.total} alerts</p>
-                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-x-2 gap-y-0.5 text-xs">
-                      <span className="text-muted-foreground">Open:</span>
-                      <span className="font-medium text-foreground">{selectedDateStats.open}</span>
-                      <span className="text-muted-foreground">Closed:</span>
-                      <span className="font-medium text-foreground">{selectedDateStats.closed}</span>
-                      <span className="text-muted-foreground">Pending:</span>
-                      <span className="font-medium text-foreground">{selectedDateStats.inProgress}</span>
-                      <span className="text-muted-foreground">Incident Auto Closed:</span>
-                      <span className="font-medium text-foreground">{selectedDateStats.incidentAutoClosed}</span>
-                    </div>
+                    <p className="text-xs text-muted-foreground mb-3 truncate">
+                      {selectedEmail ? formatReportDate(selectedEmail) : "—"}
+                    </p>
+                    <p className="text-xl font-bold text-foreground mb-4 tabular-nums">{selectedDateStats.total} alerts</p>
+                    <dl className="grid grid-cols-1 sm:grid-cols-2 gap-x-8 gap-y-3 text-sm">
+                      {(
+                        [
+                          ["Open", selectedDateStats.open],
+                          ["Closed", selectedDateStats.closed],
+                          ["Merged", selectedDateStats.merged],
+                          ["Confirmation pending from End user", selectedDateStats.pending],
+                          ["In progress", selectedDateStats.inProgress],
+                          ["Incident auto closed", selectedDateStats.incidentAutoClosed],
+                        ] as const
+                      ).map(([label, val]) => (
+                        <div key={label} className="flex items-baseline justify-between gap-4 min-w-0">
+                          <dt className="text-muted-foreground leading-snug">{label}</dt>
+                          <dd className="font-semibold tabular-nums text-foreground shrink-0">{val}</dd>
+                        </div>
+                      ))}
+                    </dl>
                   </CardContent>
                 </Card>
               </div>
@@ -518,11 +818,18 @@ export default function DailyAlerts() {
             {error && (
               <div className="mx-6 mt-4 rounded-lg border border-destructive/50 bg-destructive/10 px-4 py-3 text-sm text-destructive flex items-center justify-between gap-4">
                 <span>{error}</span>
-                {(error.toLowerCase().includes("reconnect") || error.toLowerCase().includes("expired")) && (
+                {(error.toLowerCase().includes("reconnect") || error.toLowerCase().includes("expired") || error.toLowerCase().includes("authentication")) && (
                   <Button variant="outline" size="sm" onClick={() => { window.location.href = `${API_BASE_URL}/auth/google`; }}>
                     Reconnect Gmail
                   </Button>
                 )}
+              </div>
+            )}
+
+            {loading && emails.length === 0 && (
+              <div className="px-6 py-10 flex items-center gap-3 text-sm text-muted-foreground">
+                <RefreshCw className="h-4 w-4 animate-spin" />
+                Loading daily alerts from the database…
               </div>
             )}
 
@@ -566,7 +873,7 @@ export default function DailyAlerts() {
 
             {!loading && emails.length === 0 && !error && (
               <p className="px-6 py-4 text-sm text-muted-foreground">
-                Select a month and click <strong>Refresh</strong> to load that month&apos;s PB Daily reports.
+                Select a month and click <strong>Refresh</strong> to load that month&apos;s PB Daily reports into the database. Status changes and closure comments are saved server-side so they survive page reloads and project restarts.
               </p>
             )}
           </div>

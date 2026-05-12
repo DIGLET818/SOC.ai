@@ -14,7 +14,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Calendar as CalendarIcon, RefreshCw, ChevronLeft, ChevronRight, FileText } from "lucide-react";
+import { Calendar as CalendarIcon, RefreshCw, ChevronLeft, ChevronRight, FileText, DatabaseZap } from "lucide-react";
 import { Calendar } from "@/components/ui/calendar";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
@@ -28,12 +28,37 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { API_BASE_URL } from "@/api/client";
-import { useGmailMessages } from "@/hooks/useGmailMessages";
-import { getGmailMessageBySearch, fetchLatestStatusFromEmail } from "@/api/gmail";
-import { createJiraIssue, fetchJiraIssues } from "@/api/jira";
+import { useDailyAlertsData } from "@/hooks/useDailyAlertsData";
+import {
+  upsertDailyOverride,
+  importDailyOverrides,
+  syncDailyAlerts,
+  getDailyAlerts,
+  type DailyOverrideRecord,
+  type JiraCreatedRecord,
+} from "@/api/dailyAlerts";
+import {
+  createJiraTicket,
+  linkJiraTicket,
+  importJiraTickets,
+} from "@/api/jiraTickets";
+import {
+  getGmailMessageBySearch,
+  fetchLatestStatusFromEmail,
+  GMAIL_INCIDENT_LOOKUP_LOOKBACK_DAYS,
+  type LatestStatusFromEmailResult,
+} from "@/api/gmail";
+import { fetchJiraIssues } from "@/api/jira";
 import { toast } from "@/hooks/use-toast";
 import type { GmailMessage } from "@/types/gmail";
 import type { CsvAttachment } from "@/types/gmail";
+import {
+  collectLegacyMigrationCandidates,
+  hasLegacyDailyAlertsData,
+  clearLegacyDailyAlertsLocalStorage,
+  extractLegacyMonths,
+  monthDateRange,
+} from "@/lib/legacyDailyAlertsMigration";
 
 /** Normalize header for comparison (lowercase, no spaces). */
 function norm(h: string): string {
@@ -113,21 +138,6 @@ function transformToJiraFormat(csv: CsvAttachment): {
 }
 
 const DAILY_ALERTS_SENDER = "PB_daily@global.ntt";
-const DAILY_ALERTS_SUBJECT = "PB Daily report";
-const STATUS_OVERRIDES_KEY = "sentinel_daily_alerts_status_overrides";
-const CLOSURE_COMMENTS_OVERRIDES_KEY = "sentinel_daily_alerts_closure_comments_overrides";
-const CLOSURE_DATE_OVERRIDES_KEY = "sentinel_daily_alerts_closure_date_overrides";
-const JIRA_CREATED_KEYS_KEY = "sentinel_jira_created_keys";
-
-function loadJiraCreatedKeys(): Record<string, string> {
-  try {
-    const s = localStorage.getItem(JIRA_CREATED_KEYS_KEY);
-    if (s) return JSON.parse(s) as Record<string, string>;
-  } catch {
-    /* ignore */
-  }
-  return {};
-}
 
 function getMonthRange(year: number, month: number): { afterDate: string; beforeDate: string } {
   const after = new Date(year, month - 1, 1);
@@ -137,47 +147,6 @@ function getMonthRange(year: number, month: number): { afterDate: string; before
     afterDate: `${after.getFullYear()}-${pad(after.getMonth() + 1)}-${pad(after.getDate())}`,
     beforeDate: `${before.getFullYear()}-${pad(before.getMonth() + 1)}-${pad(before.getDate())}`,
   };
-}
-
-/** First 7 days of month (e.g. March 1–7) for Jira Tickets so more reports are included. */
-function getFirstWeekRange(year: number, month: number): { afterDate: string; beforeDate: string } {
-  const after = new Date(year, month - 1, 1);
-  const before = new Date(year, month - 1, 8); // day 8 = exclusive end → days 1–7
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return {
-    afterDate: `${after.getFullYear()}-${pad(after.getMonth() + 1)}-${pad(after.getDate())}`,
-    beforeDate: `${before.getFullYear()}-${pad(before.getMonth() + 1)}-${pad(before.getDate())}`,
-  };
-}
-
-function loadStatusOverrides(): Record<string, string> {
-  try {
-    const s = localStorage.getItem(STATUS_OVERRIDES_KEY);
-    if (s) return JSON.parse(s) as Record<string, string>;
-  } catch {
-    /* ignore */
-  }
-  return {};
-}
-
-function loadClosureCommentsOverrides(): Record<string, string> {
-  try {
-    const s = localStorage.getItem(CLOSURE_COMMENTS_OVERRIDES_KEY);
-    if (s) return JSON.parse(s) as Record<string, string>;
-  } catch {
-    /* ignore */
-  }
-  return {};
-}
-
-function loadClosureDateOverrides(): Record<string, string> {
-  try {
-    const s = localStorage.getItem(CLOSURE_DATE_OVERRIDES_KEY);
-    if (s) return JSON.parse(s) as Record<string, string>;
-  } catch {
-    /* ignore */
-  }
-  return {};
 }
 
 function parseEmailDate(email: GmailMessage): number {
@@ -220,7 +189,83 @@ function getRowValue(row: Record<string, string>, ...possibleKeys: string[]): st
   return "";
 }
 
-const STATUS_COUNTS = ["Open", "Closed", "In Progress", "Merged", "Incident Auto Closed"] as const;
+function firstIncInText(text: string): string | null {
+  const m = (text || "").match(/\b(INC\d+)\b/i);
+  return m ? m[1].toUpperCase() : null;
+}
+
+/**
+ * Stable row identity (for Gmail fetch lookups + Jira-link matching).
+ * Prevents every row collapsing to `n/a-n/a` when CSV columns are blank but
+ * Title contains INC######.
+ */
+function primaryIncidentIdFromRow(row: Record<string, string>): string {
+  const incCol = getRowValue(row, "IncidentID", "Incident ID");
+  const snCol = getRowValue(row, "ServicenowTicket", "ServiceNow Ticket", "ServicenowT");
+  let id: string | null = firstIncInText(incCol) || firstIncInText(snCol);
+  if (!id) {
+    id = firstIncInText(getRowValue(row, "Title", "Short description", "Shortdescription", "Number"));
+  }
+  if (!id) {
+    const blob = Object.values(row).join("\n");
+    const incs = [...blob.matchAll(/\b(INC\d+)\b/gi)].map((m) => m[1].toUpperCase());
+    const uniq = [...new Set(incs)];
+    if (uniq.length >= 1) id = uniq[0];
+  }
+  return id ?? "";
+}
+
+/** Extra Gmail `q` tokens when IncidentID / Servicenow cells miss the thread (CS… / INC in body). */
+function extraGmailIncidentQueries(row: Record<string, string>): string[] {
+  const blob = [
+    getRowValue(row, "Title", "Short description", "Shortdescription", "Number", "Case"),
+    ...Object.values(row),
+  ]
+    .filter((s): s is string => typeof s === "string" && s.trim() !== "")
+    .join("\n");
+  const out: string[] = [];
+  const cs = blob.match(/\b(CS\d{5,})\b/i);
+  if (cs) out.push(cs[1]);
+  const inc = blob.match(/\b(INC\d{6,})\b/i);
+  if (inc) out.push(inc[1]);
+  return [...new Set(out)];
+}
+
+/** `Number("")` and `Number(null)` are 0 — would map every bad row to index 0. */
+function parseJiraTableRowIndex(row: Record<string, string>): number {
+  const v = (row as Record<string, unknown>).__rowIndex;
+  if (v === undefined || v === null || v === "") return NaN;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : NaN;
+}
+
+/** Tokens to match Jira issue summary (INC# in URLs, summary prefix before " - ", etc.). */
+function collectJiraLinkMatchTokens(incidentId: string, servicenow: string, displaySummary: string): string[] {
+  const out = new Set<string>();
+  const push = (s: string) => {
+    const t = s.trim().toLowerCase();
+    if (t.length >= 4) out.add(t);
+  };
+  const pullInc = (blob: string) => {
+    const m = blob.match(/\b(INC\d+)\b/gi);
+    if (m) for (const x of m) push(x);
+  };
+  push(incidentId);
+  push(servicenow);
+  pullInc(incidentId);
+  pullInc(servicenow);
+  const sum = displaySummary.trim();
+  if (sum) {
+    const head = sum.split(/\s-\s/).map((p) => p.trim()).filter(Boolean)[0];
+    if (head) {
+      push(head);
+      pullInc(head);
+    }
+  }
+  return [...out].sort((a, b) => b.length - a.length);
+}
+
+const STATUS_COUNTS = ["Open", "Closed", "In Progress", "Pending", "Merged", "Incident Auto Closed"] as const;
 
 function normalizeStatus(s: string): (typeof STATUS_COUNTS)[number] {
   const t = s.trim();
@@ -228,36 +273,21 @@ function normalizeStatus(s: string): (typeof STATUS_COUNTS)[number] {
   return found ?? "Open";
 }
 
+/** DB-keyed override lookup: `${messageId}-r${rowIndex}` is the canonical key. */
+function dbRowKey(messageId: string, rowIndex: number): string {
+  return `${messageId}-r${rowIndex}`;
+}
+
 function getRowStatus(
   row: Record<string, string>,
   headers: string[],
-  getRowKey: (row: Record<string, string>) => string,
+  rowKey: string,
   statusOverrides: Record<string, string>
 ): string {
-  const key = getRowKey(row);
-  if (statusOverrides[key]?.trim()) return statusOverrides[key].trim();
+  if (statusOverrides[rowKey]?.trim()) return statusOverrides[rowKey].trim();
   const statusHeader = headers.find((h) => h.toLowerCase().replace(/\s/g, "") === "status");
   const raw = statusHeader ? row[statusHeader]?.trim() : "";
   return raw || "Open";
-}
-
-function countByStatus(
-  rows: Record<string, string>[],
-  headers: string[],
-  getRowKey: (row: Record<string, string>) => string,
-  statusOverrides: Record<string, string>
-): { total: number; open: number; closed: number; inProgress: number; merged: number; incidentAutoClosed: number } {
-  const counts = { total: rows.length, open: 0, closed: 0, inProgress: 0, merged: 0, incidentAutoClosed: 0 };
-  for (const row of rows) {
-    const s = normalizeStatus(getRowStatus(row, headers, getRowKey, statusOverrides));
-    if (s === "Open") counts.open++;
-    else if (s === "Closed") counts.closed++;
-    else if (s === "In Progress") counts.inProgress++;
-    else if (s === "Merged") counts.merged++;
-    else if (s === "Incident Auto Closed") counts.incidentAutoClosed++;
-    else counts.open++;
-  }
-  return counts;
 }
 
 const now = new Date();
@@ -274,42 +304,87 @@ for (let i = 0; i < 12; i++) {
   });
 }
 
+/**
+ * Collapse the server's structured override records into the legacy
+ * `Record<string, string>` maps that CsvDataTable expects, keyed by
+ * `${messageId}-r${rowIndex}`. This keeps the table renderer untouched while
+ * letting us swap out the persistence layer.
+ */
+function flattenOverrideMaps(
+  overrides: Record<string, DailyOverrideRecord>
+): {
+  status: Record<string, string>;
+  closureComment: Record<string, string>;
+  closureDate: Record<string, string>;
+} {
+  const status: Record<string, string> = {};
+  const closureComment: Record<string, string> = {};
+  const closureDate: Record<string, string> = {};
+  for (const [key, rec] of Object.entries(overrides)) {
+    if (rec.status) status[key] = rec.status;
+    if (rec.closure_comment) closureComment[key] = rec.closure_comment;
+    if (rec.closure_date) closureDate[key] = rec.closure_date;
+  }
+  return { status, closureComment, closureDate };
+}
+
+function flattenJiraKeys(
+  jiraCreated: Record<string, JiraCreatedRecord>
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [key, rec] of Object.entries(jiraCreated)) {
+    if (rec.jiraKey) out[key] = rec.jiraKey;
+  }
+  return out;
+}
+
 export default function JiraTickets() {
   const [selectedYear, setSelectedYear] = useState(currentYear);
   const [selectedMonth, setSelectedMonth] = useState(currentMonth);
   const [selectedReportDate, setSelectedReportDate] = useState<string | null>(null);
-  const [statusOverrides, setStatusOverrides] = useState<Record<string, string>>(() => loadStatusOverrides());
-  const [closureCommentsOverrides, setClosureCommentsOverrides] = useState<Record<string, string>>(() => loadClosureCommentsOverrides());
-  const [closureDateOverrides, setClosureDateOverrides] = useState<Record<string, string>>(() => loadClosureDateOverrides());
-  const [createdJiraKeys, setCreatedJiraKeys] = useState<Record<string, string>>(() => loadJiraCreatedKeys());
 
-  /** Jira Tickets uses first 7 days of month (e.g. Mar 1–7) to show more reports. */
+  /** Same full-month Gmail window as Daily Alerts so refresh never drops later days. */
   const { afterDate, beforeDate } = useMemo(
-    () => getFirstWeekRange(selectedYear, selectedMonth),
-    [selectedYear, selectedMonth]
-  );
-
-  const storageKey = useMemo(
-    () => `sentinel_daily_alerts_emails_${selectedYear}_${selectedMonth}`,
+    () => getMonthRange(selectedYear, selectedMonth),
     [selectedYear, selectedMonth]
   );
 
   const {
     emails,
+    overrides: serverOverrides,
+    jiraCreated: serverJiraCreated,
     loading,
+    syncing,
     error,
-    refetch,
-  } = useGmailMessages({
-    from: DAILY_ALERTS_SENDER,
-    subject: DAILY_ALERTS_SUBJECT,
+    currentUser,
+    refetchFromGmail,
+    setLocalOverride,
+    setLocalJiraCreated,
+    reload,
+  } = useDailyAlertsData({
     afterDate,
     beforeDate,
-    maxResults: 100,
-    enabled: false,
-    includeCsv: true,
-    storageKey,
-    persistInLocalStorage: true,
+    maxResults: 2000,
   });
+
+  /** Auth-prompt state: the page rendered, but the server says "not signed in". */
+  const isAnonymous = currentUser === "anonymous";
+
+  /**
+   * Flatten the structured server records into the legacy-shaped maps the
+   * existing CsvDataTable / counting code already understands. Any change to
+   * `serverOverrides` immediately reflects in the table without needing a
+   * full re-render of the persistence layer.
+   */
+  const { resolvedStatusOverrides, resolvedClosureCommentsOverrides, resolvedClosureDateOverrides } = useMemo(() => {
+    const flat = flattenOverrideMaps(serverOverrides);
+    return {
+      resolvedStatusOverrides: flat.status,
+      resolvedClosureCommentsOverrides: flat.closureComment,
+      resolvedClosureDateOverrides: flat.closureDate,
+    };
+  }, [serverOverrides]);
+  const resolvedCreatedJiraKeys = useMemo(() => flattenJiraKeys(serverJiraCreated), [serverJiraCreated]);
 
   const emailsSortedByDate = useMemo(() => {
     return [...emails].sort((a, b) => parseEmailDate(a) - parseEmailDate(b));
@@ -351,163 +426,23 @@ export default function JiraTickets() {
     return reportsByDate.get(effectiveReportDate) ?? null;
   }, [effectiveReportDate, reportsByDate]);
 
-  const getRowKey = useCallback((scope: string) => (row: Record<string, string>) => {
-    const inc = getRowValue(row, "IncidentID", "Incident ID");
-    const sn = getRowValue(row, "ServicenowTicket", "ServiceNow Ticket", "ServicenowT");
-    return `${scope}-${inc || "n/a"}-${sn || "n/a"}`;
-  }, []);
-
-  /** Use report date as row key scope so status/closure/Jira keys persist across refresh (same date + incident = same key). */
-  const rowKeyScope = effectiveReportDate ?? firstReport?.id ?? "";
-
-  /** Suffix for row key: "-{incidentId}-{servicenow}" so we can match Jira keys saved with any scope (email id or date). */
-  const getRowKeySuffix = useCallback((row: Record<string, string>) => {
-    const inc = getRowValue(row, "IncidentID", "Incident ID");
-    const sn = getRowValue(row, "ServicenowTicket", "ServiceNow Ticket", "ServicenowT");
-    return `-${inc || "n/a"}-${sn || "n/a"}`;
-  }, []);
-
-  /** Resolved overrides/keys: use date-based key first, fall back to email-id key (status/closure) or any key with same row suffix (Jira) so data persists after refresh. */
-  const { resolvedStatusOverrides, resolvedClosureCommentsOverrides, resolvedClosureDateOverrides, resolvedCreatedJiraKeys } =
-    useMemo(() => {
-    const status: Record<string, string> = { ...statusOverrides };
-    const closure: Record<string, string> = { ...closureCommentsOverrides };
-    const closureDate: Record<string, string> = { ...closureDateOverrides };
-    const jira: Record<string, string> = { ...createdJiraKeys };
-    if (firstReport?.csvAttachment?.rows && rowKeyScope) {
-      for (const row of firstReport.csvAttachment.rows) {
-        const keyDate = getRowKey(rowKeyScope)(row);
-        if (!keyDate) continue;
-        if (!status[keyDate] && firstReport.id && rowKeyScope !== firstReport.id) {
-          const keyEmail = getRowKey(firstReport.id)(row);
-          if (statusOverrides[keyEmail]) status[keyDate] = statusOverrides[keyEmail];
-        }
-        if (!closure[keyDate] && firstReport.id && rowKeyScope !== firstReport.id) {
-          const keyEmail = getRowKey(firstReport.id)(row);
-          if (closureCommentsOverrides[keyEmail]) closure[keyDate] = closureCommentsOverrides[keyEmail];
-        }
-        if (!closure[keyDate]) {
-          const suffix = getRowKeySuffix(row);
-          const matched = Object.entries(closureCommentsOverrides).find(([k]) => k.endsWith(suffix));
-          if (matched) closure[keyDate] = matched[1];
-        }
-        if (!closureDate[keyDate] && firstReport.id && rowKeyScope !== firstReport.id) {
-          const keyEmail = getRowKey(firstReport.id)(row);
-          if (closureDateOverrides[keyEmail]) closureDate[keyDate] = closureDateOverrides[keyEmail];
-        }
-        if (!closureDate[keyDate]) {
-          const suffix = getRowKeySuffix(row);
-          const matched = Object.entries(closureDateOverrides).find(([k]) => k.endsWith(suffix));
-          if (matched) closureDate[keyDate] = matched[1];
-        }
-        if (!jira[keyDate]) {
-          const suffix = getRowKeySuffix(row);
-          const matched = Object.entries(createdJiraKeys).find(([k]) => k.endsWith(suffix));
-          if (matched) jira[keyDate] = matched[1];
-        }
-      }
-    }
-    return {
-      resolvedStatusOverrides: status,
-      resolvedClosureCommentsOverrides: closure,
-      resolvedClosureDateOverrides: closureDate,
-      resolvedCreatedJiraKeys: jira,
-    };
-  }, [statusOverrides, closureCommentsOverrides, closureDateOverrides, createdJiraKeys, firstReport, rowKeyScope, getRowKey, getRowKeySuffix]);
-
-  /** One-time migrate: copy email-id–keyed (or any scope) values to date keys in localStorage so they persist after refresh. Jira keys matched by row suffix. */
+  /** Reset selected date when month context changes so the new month opens on its earliest report. */
   useEffect(() => {
-    if (!firstReport?.csvAttachment?.rows?.length || !rowKeyScope) return;
-    let statusChanged = false;
-    let closureChanged = false;
-    let closureDateChanged = false;
-    let jiraChanged = false;
-    const nextStatus = { ...statusOverrides };
-    const nextClosure = { ...closureCommentsOverrides };
-    const nextClosureDate = { ...closureDateOverrides };
-    const nextJira = { ...createdJiraKeys };
-    for (const row of firstReport.csvAttachment.rows) {
-      const keyDate = getRowKey(rowKeyScope)(row);
-      if (!keyDate) continue;
-      if (!nextStatus[keyDate] && firstReport.id && rowKeyScope !== firstReport.id) {
-        const keyEmail = getRowKey(firstReport.id)(row);
-        if (nextStatus[keyEmail]) {
-          nextStatus[keyDate] = nextStatus[keyEmail];
-          statusChanged = true;
-        }
-      }
-      if (!nextClosure[keyDate] && firstReport.id && rowKeyScope !== firstReport.id) {
-        const keyEmail = getRowKey(firstReport.id)(row);
-        if (nextClosure[keyEmail]) {
-          nextClosure[keyDate] = nextClosure[keyEmail];
-          closureChanged = true;
-        }
-      }
-      if (!nextClosure[keyDate]) {
-        const suffix = getRowKeySuffix(row);
-        const matched = Object.entries(nextClosure).find(([k]) => k.endsWith(suffix));
-        if (matched) {
-          nextClosure[keyDate] = matched[1];
-          closureChanged = true;
-        }
-      }
-      if (!nextClosureDate[keyDate] && firstReport.id && rowKeyScope !== firstReport.id) {
-        const keyEmail = getRowKey(firstReport.id)(row);
-        if (nextClosureDate[keyEmail]) {
-          nextClosureDate[keyDate] = nextClosureDate[keyEmail];
-          closureDateChanged = true;
-        }
-      }
-      if (!nextClosureDate[keyDate]) {
-        const suffix = getRowKeySuffix(row);
-        const matched = Object.entries(nextClosureDate).find(([k]) => k.endsWith(suffix));
-        if (matched) {
-          nextClosureDate[keyDate] = matched[1];
-          closureDateChanged = true;
-        }
-      }
-      if (!nextJira[keyDate]) {
-        const suffix = getRowKeySuffix(row);
-        const matched = Object.entries(nextJira).find(([k]) => k.endsWith(suffix));
-        if (matched) {
-          nextJira[keyDate] = matched[1];
-          jiraChanged = true;
-        }
-      }
+    setSelectedReportDate(null);
+  }, [selectedYear, selectedMonth]);
+
+  /** Stable per-row DB key: `${messageId}-r${rowIndex}` -- mirrors the server. */
+  const getRowKey = useCallback((row: Record<string, string>) => {
+    if (!firstReport) return "";
+    const idx = parseJiraTableRowIndex(row);
+    if (Number.isNaN(idx)) {
+      // Fall back to the row's own __rowIndex set by the server payload.
+      const explicit = Number((row as Record<string, unknown>).__rowIndex);
+      if (!Number.isFinite(explicit)) return "";
+      return dbRowKey(firstReport.id, explicit);
     }
-    if (statusChanged) {
-      try {
-        localStorage.setItem(STATUS_OVERRIDES_KEY, JSON.stringify(nextStatus));
-      } catch {
-        /* ignore */
-      }
-      setStatusOverrides(nextStatus);
-    }
-    if (closureChanged) {
-      try {
-        localStorage.setItem(CLOSURE_COMMENTS_OVERRIDES_KEY, JSON.stringify(nextClosure));
-      } catch {
-        /* ignore */
-      }
-      setClosureCommentsOverrides(nextClosure);
-    }
-    if (closureDateChanged) {
-      try {
-        localStorage.setItem(CLOSURE_DATE_OVERRIDES_KEY, JSON.stringify(nextClosureDate));
-      } catch {
-        /* ignore */
-      }
-      setClosureDateOverrides(nextClosureDate);
-    }
-    if (jiraChanged) {
-      try {
-        localStorage.setItem(JIRA_CREATED_KEYS_KEY, JSON.stringify(nextJira));
-      } catch {
-        /* ignore */
-      }
-      setCreatedJiraKeys(nextJira);
-    }
-  }, [firstReport?.id, firstReport?.csvAttachment?.rows, rowKeyScope, getRowKey, getRowKeySuffix]); // Intentionally not depending on statusOverrides/closureCommentsOverrides/createdJiraKeys to avoid loops
+    return dbRowKey(firstReport.id, idx);
+  }, [firstReport]);
 
   /** Table data for the selected date only (no merging across days). */
   const transformedData = useMemo(() => {
@@ -525,49 +460,73 @@ export default function JiraTickets() {
   }, [transformedData, firstReport]);
 
   const firstReportStats = useMemo(() => {
-    if (!firstReport?.csvAttachment) return { total: 0, open: 0, closed: 0, inProgress: 0, merged: 0, incidentAutoClosed: 0 };
+    if (!firstReport?.csvAttachment) {
+      return { total: 0, open: 0, closed: 0, inProgress: 0, pending: 0, merged: 0, incidentAutoClosed: 0 };
+    }
     const { headers, rows } = firstReport.csvAttachment;
-    return countByStatus(rows, headers, getRowKey(rowKeyScope), resolvedStatusOverrides);
-  }, [firstReport, resolvedStatusOverrides, getRowKey, rowKeyScope]);
+    const counts = { total: rows.length, open: 0, closed: 0, inProgress: 0, pending: 0, merged: 0, incidentAutoClosed: 0 };
+    for (let i = 0; i < rows.length; i++) {
+      const key = dbRowKey(firstReport.id, i);
+      const s = normalizeStatus(getRowStatus(rows[i], headers, key, resolvedStatusOverrides));
+      if (s === "Open") counts.open++;
+      else if (s === "Closed") counts.closed++;
+      else if (s === "In Progress") counts.inProgress++;
+      else if (s === "Pending") counts.pending++;
+      else if (s === "Merged") counts.merged++;
+      else if (s === "Incident Auto Closed") counts.incidentAutoClosed++;
+      else counts.open++;
+    }
+    return counts;
+  }, [firstReport, resolvedStatusOverrides]);
 
-  const handleStatusChange = useCallback((row: Record<string, string>, newStatus: string, scope: string) => {
-    const key = getRowKey(scope)(row);
-    setStatusOverrides((prev) => {
-      const next = { ...prev, [key]: newStatus };
+  /**
+   * Persist a single override: optimistically update the local state, then
+   * PATCH the server. On server failure we surface a toast but DON'T revert
+   * the optimistic update (server-side error is the exception, not the rule;
+   * forcing a revert would lose the analyst's keystrokes).
+   */
+  const persistOverride = useCallback(
+    async (
+      rowIndex: number,
+      field: "status" | "closure_comment" | "closure_date",
+      value: string
+    ) => {
+      if (!firstReport) return;
+      const actor = currentUser && currentUser !== "anonymous" ? { email: currentUser.email } : undefined;
+      setLocalOverride(firstReport.id, rowIndex, field, value, actor);
       try {
-        localStorage.setItem(STATUS_OVERRIDES_KEY, JSON.stringify(next));
-      } catch {
-        /* ignore */
+        await upsertDailyOverride({
+          messageId: firstReport.id,
+          rowIndex,
+          field,
+          value,
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "Failed to save override";
+        toast({
+          title: "Save failed (server)",
+          description: `${msg}. Your edit is visible locally; refresh to retry.`,
+          variant: "destructive",
+        });
       }
-      return next;
-    });
-  }, [getRowKey]);
+    },
+    [firstReport, currentUser, setLocalOverride]
+  );
 
-  const handleClosureCommentsChange = useCallback((row: Record<string, string>, newValue: string, scope: string) => {
-    const key = getRowKey(scope)(row);
-    setClosureCommentsOverrides((prev) => {
-      const next = { ...prev, [key]: newValue };
-      try {
-        localStorage.setItem(CLOSURE_COMMENTS_OVERRIDES_KEY, JSON.stringify(next));
-      } catch {
-        /* ignore */
-      }
-      return next;
-    });
-  }, [getRowKey]);
+  const handleStatusChange = useCallback(
+    (rowIndex: number, newStatus: string) => persistOverride(rowIndex, "status", newStatus),
+    [persistOverride]
+  );
 
-  const handleClosureDateChange = useCallback((row: Record<string, string>, newValue: string, scope: string) => {
-    const key = getRowKey(scope)(row);
-    setClosureDateOverrides((prev) => {
-      const next = { ...prev, [key]: newValue };
-      try {
-        localStorage.setItem(CLOSURE_DATE_OVERRIDES_KEY, JSON.stringify(next));
-      } catch {
-        /* ignore */
-      }
-      return next;
-    });
-  }, [getRowKey]);
+  const handleClosureCommentsChange = useCallback(
+    (rowIndex: number, newValue: string) => persistOverride(rowIndex, "closure_comment", newValue),
+    [persistOverride]
+  );
+
+  const handleClosureDateChange = useCallback(
+    (rowIndex: number, newValue: string) => persistOverride(rowIndex, "closure_date", newValue),
+    [persistOverride]
+  );
 
   const [trailEmail, setTrailEmail] = useState<GmailMessage | null>(null);
   const [trailLoading, setTrailLoading] = useState(false);
@@ -581,105 +540,235 @@ export default function JiraTickets() {
   const [createAllConfirmPayload, setCreateAllConfirmPayload] = useState<{ alreadyHave: number; toCreate: number } | null>(null);
   const [linkingExistingJira, setLinkingExistingJira] = useState(false);
 
-  const saveJiraKey = useCallback((rowKey: string, issueKey: string) => {
-    setCreatedJiraKeys((prev) => {
-      const next = { ...prev, [rowKey]: issueKey };
-      try {
-        localStorage.setItem(JIRA_CREATED_KEYS_KEY, JSON.stringify(next));
-      } catch {
-        /* ignore */
-      }
-      return next;
-    });
-  }, []);
+  /** Migration banner state (one-shot import of legacy localStorage data). */
+  const [legacyDataPresent, setLegacyDataPresent] = useState<boolean>(() => hasLegacyDailyAlertsData());
+  const [importing, setImporting] = useState(false);
+  const [importStage, setImportStage] = useState<string>("");
 
+  const handleImportLegacy = useCallback(async () => {
+    setImporting(true);
+    setImportStage("");
+    try {
+      // 1. Figure out which months our localStorage keys point at. Most
+      //    legacy entries are date-scoped (`YYYY-MM-DD-${inc}-${sn}`) so we
+      //    can extract a unique set of YYYY-MM buckets and only sync those
+      //    -- avoids a full Gmail re-fetch when the user only edited a
+      //    handful of months.
+      const months = extractLegacyMonths();
+      const seenIds = new Set<string>();
+      const allEmails: GmailMessage[] = [];
+      const pushUnique = (list: GmailMessage[]) => {
+        for (const e of list) {
+          if (e?.id && !seenIds.has(e.id)) {
+            seenIds.add(e.id);
+            allEmails.push(e);
+          }
+        }
+      };
+      // Always include whatever's already on screen so the user's currently
+      // visible month is part of the matcher's row index even if no
+      // localStorage key references it directly.
+      pushUnique(emails);
+
+      for (let i = 0; i < months.length; i++) {
+        const ym = months[i];
+        const range = monthDateRange(ym);
+        if (!range) continue;
+        setImportStage(`Syncing ${ym} (${i + 1}/${months.length})…`);
+        try {
+          await syncDailyAlerts({ afterDate: range.afterDate, beforeDate: range.beforeDate });
+        } catch (err) {
+          // Sync failures are non-fatal -- the month may still have rows
+          // already in the DB from a prior sync. Carry on and try to load.
+          // eslint-disable-next-line no-console
+          console.warn(`[JiraTickets import] sync failed for ${ym}:`, err);
+        }
+        try {
+          const data = await getDailyAlerts({ afterDate: range.afterDate, beforeDate: range.beforeDate });
+          pushUnique(data.emails ?? []);
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.warn(`[JiraTickets import] load failed for ${ym}:`, err);
+        }
+      }
+
+      setImportStage("Matching legacy edits to rows…");
+      const candidates = collectLegacyMigrationCandidates(allEmails);
+      const totals = candidates.legacyEntryCounts;
+      const totalLocal =
+        totals.status + totals.closureComment + totals.closureDate + totals.jira;
+
+      let importedOverrides = 0;
+      let importedJira = 0;
+      if (candidates.overrides.length > 0) {
+        setImportStage(`Uploading ${candidates.overrides.length} edits…`);
+        const r = await importDailyOverrides(candidates.overrides);
+        importedOverrides = r.imported;
+      }
+      if (candidates.jiraTickets.length > 0) {
+        setImportStage(`Uploading ${candidates.jiraTickets.length} Jira mappings…`);
+        const r = await importJiraTickets(candidates.jiraTickets);
+        importedJira = r.imported;
+      }
+      // Reload from DB so the UI now reads from the freshly-imported records.
+      setImportStage("Reloading current month…");
+      await reload();
+
+      const matched = candidates.overrides.length + candidates.jiraTickets.length;
+      const unmatched = candidates.unmatchedKeys.length;
+      const description =
+        `Imported ${importedOverrides} edits and ${importedJira} Jira mappings into the database.` +
+        (unmatched > 0
+          ? ` ${unmatched} legacy entries still didn't match any synced report -- they may belong to deleted Gmail messages or to months outside your sync history.`
+          : ` All ${totalLocal} legacy entries are now in the database.`) +
+        ` (${matched} candidates considered, ${months.length} month(s) synced, ${allEmails.length} email(s) scanned.)`;
+      toast({ title: "Import complete", description });
+
+      // Diagnostics: when we still couldn't match anything, dump a few
+      // sample legacy keys + the loaded row identities to the console.
+      if (matched === 0 && totalLocal > 0) {
+        // eslint-disable-next-line no-console
+        console.warn("[JiraTickets import] 0 matches against", candidates.diagnostics.rowsLoaded, "loaded rows after sync.", {
+          monthsSynced: months,
+          emailsScanned: allEmails.length,
+          sampleLegacyKeys: candidates.diagnostics.sampleLegacyKeys,
+          sampleParsed: candidates.diagnostics.sampleParsed,
+          sampleRowIdentities: candidates.diagnostics.sampleRowIdentities,
+        });
+      }
+
+      if (unmatched === 0) {
+        clearLegacyDailyAlertsLocalStorage();
+        setLegacyDataPresent(false);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Import failed";
+      toast({ title: "Import failed", description: msg, variant: "destructive" });
+    } finally {
+      setImporting(false);
+      setImportStage("");
+    }
+  }, [emails, reload]);
+
+  /**
+   * Create a Jira issue for one row through the DB-backed endpoint. The server
+   * dedupes by (messageId, rowIndex) so a successful create persists the
+   * mapping and a re-click on the same row returns the existing key instead
+   * of double-creating in Jira.
+   */
   const handleCreateInJira = useCallback(async (
     displayRow: Record<string, string>,
     effectiveStatus?: string,
-    rowKey?: string,
     effectiveClosureComment?: string,
     effectiveClosureDate?: string,
   ) => {
+    if (!firstReport) return;
     const rowId = String((displayRow as Record<string, unknown>).__rowIndex ?? "");
+    const rowIndex = parseJiraTableRowIndex(displayRow);
+    if (!Number.isFinite(rowIndex)) return;
     setJiraCreatingKey(rowId);
     const statusToSend = effectiveStatus ?? displayRow.Status ?? "";
     const closureToSend = (effectiveClosureComment ?? displayRow.Closure_Comments ?? "").trim();
     const closureDateToSend = (effectiveClosureDate ?? displayRow["Closure date"] ?? "").trim();
     try {
-      const res = await createJiraIssue({
+      const res = await createJiraTicket({
+        messageId: firstReport.id,
+        rowIndex,
         summary: displayRow.Summary ?? "",
         description: displayRow.Description ?? "",
         status: statusToSend,
+        incidentCategory: displayRow["Incident Category"] ?? "",
+        closureComments: closureToSend,
         created: displayRow.Created ?? "",
-        incident_category: displayRow["Incident Category"] ?? "",
-        closure_comments: closureToSend,
-        closure_date: closureDateToSend,
+        closureDate: closureDateToSend,
       });
-      const issueKey = res?.key ?? res?.id ?? "";
-      if (issueKey && rowKey) saveJiraKey(rowKey, issueKey);
-      toast({ title: "Created in Jira", description: `Issue ${issueKey} created.` });
+      // Optimistically update so the cell flips to the new key without waiting
+      // for a full reload from the DB.
+      setLocalJiraCreated(firstReport.id, rowIndex, {
+        jiraKey: res.ticket.jiraKey,
+        jiraUrl: res.ticket.jiraUrl,
+        createdBy: res.ticket.createdBy,
+        createdAt: res.ticket.createdAt,
+      });
+      toast({
+        title: res.deduped ? "Already linked" : "Created in Jira",
+        description: res.deduped
+          ? `Row already has Jira ticket ${res.ticket.jiraKey} -- no duplicate created.`
+          : `Issue ${res.ticket.jiraKey} created and saved to the database.`,
+      });
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Failed to create Jira issue";
-      toast({ title: "Jira create failed", description: msg, variant: "destructive" });
+      const hint =
+        /permission|do not have permission|401|403/i.test(msg)
+          ? " Ask a Jira admin to grant Create issues on this project for the account used in JIRA_EMAIL, and confirm JIRA_PROJECT_KEY is correct (see docs/JIRA_SETUP.md)."
+          : "";
+      toast({ title: "Jira create failed", description: `${msg}${hint}`, variant: "destructive" });
     } finally {
       setJiraCreatingKey(null);
     }
-  }, [saveJiraKey]);
+  }, [firstReport, setLocalJiraCreated]);
 
   const handleFetchAllLatestStatus = useCallback(async () => {
-    if (!transformedData?.rows.length || !firstReport || !rowKeyScope) return;
+    if (!transformedData?.rows.length || !firstReport) return;
     setFetchingAllStatus(true);
     setFetchAllProgress({ current: 0, total: transformedData.rows.length });
     let updated = 0;
+    let datesSet = 0;
+    let mergedNtt = 0;
+    let mergedDateFromCreated = 0;
     const total = transformedData.rows.length;
+    const headers = firstReport.csvAttachment?.headers ?? [];
     try {
       for (let i = 0; i < transformedData.rows.length; i++) {
         setFetchAllProgress({ current: i + 1, total });
         const { original } = transformedData.rows[i];
+        const rowIndex = i;
+        const rowKey = dbRowKey(firstReport.id, rowIndex);
+        if (headers.length) {
+          const st = normalizeStatus(getRowStatus(original, headers, rowKey, resolvedStatusOverrides));
+          if (st === "Merged") {
+            const createdVal = getRowValue(original, "Created", "Created On").trim();
+            await persistOverride(rowIndex, "closure_comment", "NTT");
+            if (createdVal) {
+              mergedDateFromCreated++;
+              await persistOverride(rowIndex, "closure_date", createdVal);
+            }
+            mergedNtt++;
+            continue;
+          }
+        }
         const servicenowTicket = getRowValue(original, "ServicenowTicket", "ServiceNow Ticket", "ServicenowT");
         const incidentId = getRowValue(original, "IncidentID", "Incident ID");
         const searchFirst = servicenowTicket || incidentId;
         const searchFallback = servicenowTicket ? incidentId : "";
-        if (!searchFirst && !searchFallback) continue;
+        const extraQs = extraGmailIncidentQueries(original);
+        if (!searchFirst.trim() && !searchFallback.trim() && extraQs.length === 0) continue;
         try {
-          let result = await fetchLatestStatusFromEmail({ q: searchFirst, newerThanDays: 30 });
-          if (!result.suggestedStatus && searchFallback) {
-            result = await fetchLatestStatusFromEmail({ q: searchFallback, newerThanDays: 30 });
+          const tried = new Set<string>();
+          let result: LatestStatusFromEmailResult = { suggestedStatus: null };
+          const run = async (q: string) => {
+            const t = q.trim();
+            if (!t || tried.has(t)) return;
+            tried.add(t);
+            result = await fetchLatestStatusFromEmail({ q: t });
+          };
+          if (searchFirst.trim()) await run(searchFirst);
+          if (!result.suggestedStatus && searchFallback.trim()) await run(searchFallback);
+          if (!result.suggestedStatus) {
+            for (const q of extraQs) {
+              await run(q);
+              if (result.suggestedStatus) break;
+            }
           }
           if (result.suggestedStatus === "Closed" || result.suggestedStatus === "Incident Auto Closed") {
-            const rowKey = getRowKey(rowKeyScope)(original);
             const statusToSet = result.suggestedStatus === "Incident Auto Closed" ? "Incident Auto Closed" : "Closed";
-            setStatusOverrides((prev) => {
-              const next = { ...prev, [rowKey]: statusToSet };
-              try {
-                localStorage.setItem(STATUS_OVERRIDES_KEY, JSON.stringify(next));
-              } catch {
-                /* ignore */
-              }
-              return next;
-            });
-            setClosureCommentsOverrides((prev) => {
-              if ((prev[rowKey] ?? "").trim()) return prev;
-              const closure = (result.suggestedClosureComment ?? "").trim() || "Closed from email";
-              const next = { ...prev, [rowKey]: closure };
-              try {
-                localStorage.setItem(CLOSURE_COMMENTS_OVERRIDES_KEY, JSON.stringify(next));
-              } catch {
-                /* ignore */
-              }
-              return next;
-            });
+            const closure = (result.suggestedClosureComment ?? "").trim() || "Closed from email";
             const dateIso = (result.matchedEmailDateIso ?? "").trim();
+            await persistOverride(rowIndex, "status", statusToSet);
+            await persistOverride(rowIndex, "closure_comment", closure);
             if (dateIso) {
-              setClosureDateOverrides((prev) => {
-                const next = { ...prev, [rowKey]: dateIso };
-                try {
-                  localStorage.setItem(CLOSURE_DATE_OVERRIDES_KEY, JSON.stringify(next));
-                } catch {
-                  /* ignore */
-                }
-                return next;
-              });
+              datesSet++;
+              await persistOverride(rowIndex, "closure_date", dateIso);
             }
             updated++;
           }
@@ -687,21 +776,34 @@ export default function JiraTickets() {
           /* skip this row on error */
         }
       }
+      const parts: string[] = [];
+      if (mergedNtt > 0) {
+        parts.push(
+          mergedDateFromCreated > 0
+            ? `${mergedNtt} merged → NTT (${mergedDateFromCreated} with closure date from Created)`
+            : `${mergedNtt} merged → NTT`
+        );
+      }
+      if (updated > 0) {
+        parts.push(datesSet > 0 ? `${updated} closed from email (${datesSet} with Gmail closure date)` : `${updated} closed from email`);
+      }
+      if (parts.length === 0) parts.push("No rows updated");
+      parts.push(`${total - mergedNtt - updated} unchanged`);
       toast({
         title: "Fetch all complete (this day)",
-        description: `${updated} alert(s) set to Closed from email; ${total - updated} unchanged.`,
+        description: parts.join("; ") + ".",
       });
     } finally {
       setFetchingAllStatus(false);
       setFetchAllProgress(null);
     }
-  }, [transformedData, firstReport, rowKeyScope, getRowKey]);
+  }, [transformedData, firstReport, resolvedStatusOverrides, persistOverride]);
 
   const handleCreateAllInJiraClick = useCallback(() => {
     if (!transformedData?.rows.length || !firstReport) return;
     let alreadyHave = 0;
     for (let i = 0; i < transformedData.rows.length; i++) {
-      const rowKey = getRowKey(rowKeyScope)(transformedData.rows[i].original);
+      const rowKey = dbRowKey(firstReport.id, i);
       if (resolvedCreatedJiraKeys[rowKey]) alreadyHave++;
     }
     const toCreate = transformedData.rows.length - alreadyHave;
@@ -711,93 +813,128 @@ export default function JiraTickets() {
     }
     setCreateAllConfirmPayload({ alreadyHave, toCreate });
     setCreateAllConfirmOpen(true);
-  }, [transformedData, firstReport, rowKeyScope, getRowKey, resolvedCreatedJiraKeys]);
+  }, [transformedData, firstReport, resolvedCreatedJiraKeys]);
 
   const handleCreateAllInJiraConfirm = useCallback(async () => {
     setCreateAllConfirmOpen(false);
     if (!transformedData?.rows.length || !firstReport) return;
-    const rowsToCreate = transformedData.rows.filter((r) => !resolvedCreatedJiraKeys[getRowKey(rowKeyScope)(r.original)]);
+    const rowsToCreate: Array<{ display: Record<string, string>; original: Record<string, string>; rowIndex: number }> = [];
+    for (let i = 0; i < transformedData.rows.length; i++) {
+      const rowKey = dbRowKey(firstReport.id, i);
+      if (!resolvedCreatedJiraKeys[rowKey]) {
+        rowsToCreate.push({ ...transformedData.rows[i], rowIndex: i });
+      }
+    }
     if (rowsToCreate.length === 0) return;
     setCreatingAllJira(true);
     const total = rowsToCreate.length;
     setCreateAllJiraProgress({ current: 0, total });
     let created = 0;
+    let deduped = 0;
     let failed = 0;
+    let stoppedReason: string | null = null;
     try {
       for (let i = 0; i < rowsToCreate.length; i++) {
         setCreateAllJiraProgress({ current: i + 1, total });
-        const { display, original } = rowsToCreate[i];
-        const rowKey = getRowKey(rowKeyScope)(original);
-        const effectiveStatus = (rowKey && resolvedStatusOverrides[rowKey]) ? resolvedStatusOverrides[rowKey] : (display.Status ?? "");
-        const effectiveClosure = (rowKey && resolvedClosureCommentsOverrides[rowKey]) ? resolvedClosureCommentsOverrides[rowKey] : (display.Closure_Comments ?? "");
-        const effectiveClosureDate = (rowKey && resolvedClosureDateOverrides[rowKey])
-          ? resolvedClosureDateOverrides[rowKey]
-          : (display["Closure date"] ?? "");
+        const { display, rowIndex } = rowsToCreate[i];
+        const rowKey = dbRowKey(firstReport.id, rowIndex);
+        const effectiveStatus = resolvedStatusOverrides[rowKey] ?? (display.Status ?? "");
+        const effectiveClosure = resolvedClosureCommentsOverrides[rowKey] ?? (display.Closure_Comments ?? "");
+        const effectiveClosureDate = resolvedClosureDateOverrides[rowKey] ?? (display["Closure date"] ?? "");
         try {
-          const res = await createJiraIssue({
+          const res = await createJiraTicket({
+            messageId: firstReport.id,
+            rowIndex,
             summary: display.Summary ?? "",
             description: display.Description ?? "",
             status: effectiveStatus,
+            incidentCategory: display["Incident Category"] ?? "",
+            closureComments: effectiveClosure.trim(),
             created: display.Created ?? "",
-            incident_category: display["Incident Category"] ?? "",
-            closure_comments: effectiveClosure.trim(),
-            closure_date: effectiveClosureDate.trim(),
+            closureDate: effectiveClosureDate.trim(),
           });
-          const issueKey = res?.key ?? res?.id ?? "";
-          if (issueKey && rowKey) saveJiraKey(rowKey, issueKey);
-          created++;
-        } catch {
+          setLocalJiraCreated(firstReport.id, rowIndex, {
+            jiraKey: res.ticket.jiraKey,
+            jiraUrl: res.ticket.jiraUrl,
+            createdBy: res.ticket.createdBy,
+            createdAt: res.ticket.createdAt,
+          });
+          if (res.deduped) deduped++;
+          else created++;
+        } catch (err) {
           failed++;
+          const msg = err instanceof Error ? err.message : String(err);
+          if (/permission|do not have permission|401|403/i.test(msg)) {
+            stoppedReason = msg;
+            break;
+          }
         }
       }
+      const skipped = stoppedReason ? rowsToCreate.length - created - deduped - failed : 0;
+      const dedupeNote = deduped > 0 ? `; ${deduped} already linked (no duplicate created)` : "";
       toast({
-        title: "Create all in Jira complete",
-        description: `${created} ticket(s) created for this day; ${failed} failed.`,
-        variant: failed > 0 ? "destructive" : "default",
+        title: stoppedReason ? "Create all in Jira stopped" : "Create all in Jira complete",
+        description: stoppedReason
+          ? `${created} created before error${dedupeNote}. ${stoppedReason}${skipped > 0 ? ` (${skipped} not attempted.)` : ""} Fix Jira permissions (docs/JIRA_SETUP.md) and retry.`
+          : `${created} ticket(s) created for this day${dedupeNote}; ${failed} failed.`,
+        variant: failed > 0 || stoppedReason ? "destructive" : "default",
       });
     } finally {
       setCreatingAllJira(false);
       setCreateAllJiraProgress(null);
       setCreateAllConfirmPayload(null);
     }
-  }, [transformedData, firstReport, rowKeyScope, getRowKey, resolvedStatusOverrides, resolvedClosureCommentsOverrides, resolvedClosureDateOverrides, resolvedCreatedJiraKeys, saveJiraKey]);
+  }, [transformedData, firstReport, resolvedStatusOverrides, resolvedClosureCommentsOverrides, resolvedClosureDateOverrides, resolvedCreatedJiraKeys, setLocalJiraCreated]);
 
   const handleCreateAllInJira = useCallback(() => {
     handleCreateAllInJiraClick();
   }, [handleCreateAllInJiraClick]);
 
   const handleLinkExistingJiraTickets = useCallback(async () => {
-    if (!transformedData?.rows.length || !rowKeyScope) return;
+    if (!transformedData?.rows.length || !firstReport) return;
     setLinkingExistingJira(true);
     try {
-      const issues = await fetchJiraIssues(300);
+      const issues = await fetchJiraIssues(1500);
       const usedIssueKeys = new Set<string>();
       let linked = 0;
-      for (const { original, display } of transformedData.rows) {
-        const rowKey = getRowKey(rowKeyScope)(original);
+      for (let i = 0; i < transformedData.rows.length; i++) {
+        const { original, display } = transformedData.rows[i];
+        const rowIndex = i;
+        const rowKey = dbRowKey(firstReport.id, rowIndex);
         if (resolvedCreatedJiraKeys[rowKey]) continue;
-        const incidentId = getRowValue(original, "IncidentID", "Incident ID");
+        const incidentId = primaryIncidentIdFromRow(original) || getRowValue(original, "IncidentID", "Incident ID");
         const servicenow = getRowValue(original, "ServicenowTicket", "ServiceNow Ticket", "ServicenowT");
         const summary = (display.Summary ?? "").trim();
+        const tokens = collectJiraLinkMatchTokens(incidentId, servicenow, summary);
         const match = issues.find((iss) => {
           if (usedIssueKeys.has(iss.key)) return false;
           const s = (iss.summary ?? "").toLowerCase();
-          const inc = (incidentId ?? "").toLowerCase();
-          const sn = (servicenow ?? "").toLowerCase();
-          if (inc && s.includes(inc)) return true;
-          if (sn && s.includes(sn)) return true;
-          if (summary && s.includes(summary.slice(0, 20).toLowerCase())) return true;
+          for (const tok of tokens) {
+            if (tok && s.includes(tok)) return true;
+          }
           return false;
         });
         if (match) {
           usedIssueKeys.add(match.key);
-          saveJiraKey(rowKey, match.key);
-          linked++;
+          try {
+            await linkJiraTicket({
+              messageId: firstReport.id,
+              rowIndex,
+              jiraKey: match.key,
+            });
+            setLocalJiraCreated(firstReport.id, rowIndex, { jiraKey: match.key });
+            linked++;
+          } catch {
+            /* skip individual link errors */
+          }
         }
       }
       toast({
         title: "Link existing Jira tickets",
-        description: linked > 0 ? `Linked ${linked} Jira ticket(s) to alerts for this day.` : "No matching Jira tickets found. Ensure issue summaries contain the incident or ticket ID.",
+        description:
+          linked > 0
+            ? `Linked ${linked} Jira ticket(s) to alerts for this day -- saved to the database.`
+            : "No matching Jira tickets found. Issue summary must contain the same INC/Servicenow ID as the row (we search up to 1500 newest issues in the project).",
       });
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Failed to fetch Jira issues";
@@ -805,47 +942,71 @@ export default function JiraTickets() {
     } finally {
       setLinkingExistingJira(false);
     }
-  }, [transformedData, rowKeyScope, getRowKey, resolvedCreatedJiraKeys, saveJiraKey]);
+  }, [transformedData, firstReport, resolvedCreatedJiraKeys, setLocalJiraCreated]);
 
-  const handleFetchLatestStatus = useCallback(async (originalRow: Record<string, string>) => {
+  const handleFetchLatestStatus = useCallback(async (originalRow: Record<string, string>, rowIndex: number) => {
+    if (!firstReport) return;
     const servicenowTicket = getRowValue(originalRow, "ServicenowTicket", "ServiceNow Ticket", "ServicenowT");
     const incidentId = getRowValue(originalRow, "IncidentID", "Incident ID");
     const searchFirst = servicenowTicket || incidentId;
     const searchFallback = servicenowTicket ? incidentId : "";
-    if (!searchFirst && !searchFallback) {
-      toast({ title: "No ticket or incident ID", description: "This row has no ServicenowTicket or IncidentID to search.", variant: "destructive" });
+    const extraQs = extraGmailIncidentQueries(originalRow);
+    if (!searchFirst.trim() && !searchFallback.trim() && extraQs.length === 0) {
+      toast({ title: "No ticket or incident ID", description: "This row has no ServicenowTicket, IncidentID, or INC/CS in row text to search.", variant: "destructive" });
       return;
     }
-    const rowKey = rowKeyScope ? getRowKey(rowKeyScope)(originalRow) : "";
+    const rowKey = dbRowKey(firstReport.id, rowIndex);
     setFetchingStatusKey(rowKey);
     try {
-      let result = await fetchLatestStatusFromEmail({ q: searchFirst, newerThanDays: 30 });
-      if (!result.suggestedStatus && searchFallback) {
-        result = await fetchLatestStatusFromEmail({ q: searchFallback, newerThanDays: 30 });
+      if (firstReport.csvAttachment?.headers?.length) {
+        const st = normalizeStatus(
+          getRowStatus(originalRow, firstReport.csvAttachment.headers, rowKey, resolvedStatusOverrides)
+        );
+        if (st === "Merged") {
+          await handleClosureCommentsChange(rowIndex, "NTT");
+          const createdVal = getRowValue(originalRow, "Created", "Created On").trim();
+          if (createdVal) await handleClosureDateChange(rowIndex, createdVal);
+          toast({
+            title: "Merged alert (NTT)",
+            description: "Closure set to NTT; closure date matches Created (auto-closed by NTT).",
+          });
+          return;
+        }
+      }
+      const tried = new Set<string>();
+      let result: LatestStatusFromEmailResult = { suggestedStatus: null };
+      const run = async (q: string) => {
+        const t = q.trim();
+        if (!t || tried.has(t)) return;
+        tried.add(t);
+        result = await fetchLatestStatusFromEmail({ q: t });
+      };
+      if (searchFirst.trim()) await run(searchFirst);
+      if (!result.suggestedStatus && searchFallback.trim()) await run(searchFallback);
+      if (!result.suggestedStatus) {
+        for (const q of extraQs) {
+          await run(q);
+          if (result.suggestedStatus) break;
+        }
       }
       if (result.error && !result.suggestedStatus) {
         const isNoEmail = /no matching email/i.test(result.error);
         toast({
           title: isNoEmail ? "No email found" : "Fetch status failed",
           description: isNoEmail
-            ? "No email mentioning this incident/ticket in the last 30 days (searches all senders)."
+            ? `No email mentioning this incident/ticket in the last ${GMAIL_INCIDENT_LOOKUP_LOOKBACK_DAYS} days (searches all senders).`
             : result.error,
           variant: isNoEmail ? "default" : "destructive",
         });
         return;
       }
-      if (
-        (result.suggestedStatus === "Closed" || result.suggestedStatus === "Incident Auto Closed") &&
-        rowKeyScope
-      ) {
+      if (result.suggestedStatus === "Closed" || result.suggestedStatus === "Incident Auto Closed") {
         const statusToSet = result.suggestedStatus === "Incident Auto Closed" ? "Incident Auto Closed" : "Closed";
-        handleStatusChange(originalRow, statusToSet, rowKeyScope);
+        await handleStatusChange(rowIndex, statusToSet);
         const closure = (result.suggestedClosureComment ?? "").trim() || "Closed from email";
-        handleClosureCommentsChange(originalRow, closure, rowKeyScope);
+        await handleClosureCommentsChange(rowIndex, closure);
         const dateIso = (result.matchedEmailDateIso ?? "").trim();
-        if (dateIso) {
-          handleClosureDateChange(originalRow, dateIso, rowKeyScope);
-        }
+        if (dateIso) await handleClosureDateChange(rowIndex, dateIso);
         toast({
           title: "Status updated from email",
           description: result.foundPhrase
@@ -867,7 +1028,7 @@ export default function JiraTickets() {
     } finally {
       setFetchingStatusKey(null);
     }
-  }, [getRowKey, handleStatusChange, handleClosureCommentsChange, handleClosureDateChange, rowKeyScope]);
+  }, [firstReport, resolvedStatusOverrides, handleStatusChange, handleClosureCommentsChange, handleClosureDateChange]);
 
   const handleAlertRowClick = useCallback(async (row: Record<string, string>) => {
     const servicenowTicket = getRowValue(row, "ServicenowTicket", "ServiceNow Ticket", "ServicenowT");
@@ -883,10 +1044,10 @@ export default function JiraTickets() {
     try {
       let email: GmailMessage | null = null;
       if (searchFirst) {
-        email = await getGmailMessageBySearch({ q: searchFirst, newerThanDays: 30 });
+        email = await getGmailMessageBySearch({ q: searchFirst });
       }
       if (!email && searchFallback) {
-        email = await getGmailMessageBySearch({ q: searchFallback, newerThanDays: 30 });
+        email = await getGmailMessageBySearch({ q: searchFallback });
       }
       if (email) {
         setTrailEmail(email);
@@ -964,9 +1125,15 @@ export default function JiraTickets() {
                   <ChevronRight className="h-4 w-4" />
                 </Button>
               </div>
-              <Button variant="outline" size="sm" onClick={refetch} disabled={loading} className="shrink-0">
-                <RefreshCw className={`h-4 w-4 mr-2 ${loading ? "animate-spin" : ""}`} />
-                Refresh
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => refetchFromGmail()}
+                disabled={loading || syncing}
+                className="shrink-0"
+              >
+                <RefreshCw className={`h-4 w-4 mr-2 ${syncing ? "animate-spin" : ""}`} />
+                {syncing ? "Syncing…" : "Refresh"}
               </Button>
               {availableDates.length > 0 && effectiveReportDate && (
                 <Popover>
@@ -1019,6 +1186,49 @@ export default function JiraTickets() {
             </div>
           </header>
 
+          {legacyDataPresent && !isAnonymous && (
+            <div className="shrink-0 border-b border-amber-500/40 bg-amber-500/10 px-6 py-3">
+              <div className="flex items-start gap-3">
+                <DatabaseZap className="h-5 w-5 mt-0.5 text-amber-600 dark:text-amber-300 shrink-0" />
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm font-semibold text-amber-700 dark:text-amber-200">
+                    Legacy edits detected in this browser.
+                  </p>
+                  <p className="text-xs text-amber-700/80 dark:text-amber-200/80 mt-0.5">
+                    Status, comments and Jira ticket IDs you saved before the database migration are still in localStorage. Click Import to push them into the database so they survive refreshes, restarts, and other browsers. The importer will automatically sync every month referenced by your local edits before matching, so you only have to click once -- it may take a minute if you have many months of history.
+                  </p>
+                  {importing && importStage && (
+                    <p className="text-xs text-amber-700 dark:text-amber-200 mt-1 font-medium">
+                      {importStage}
+                    </p>
+                  )}
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <Button
+                    size="sm"
+                    variant="default"
+                    onClick={handleImportLegacy}
+                    disabled={importing}
+                  >
+                    {importing ? (importStage || "Importing…") : "Import local edits + Jira tickets"}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => {
+                      clearLegacyDailyAlertsLocalStorage();
+                      setLegacyDataPresent(false);
+                      toast({ title: "Dismissed", description: "Local edits cleared from this browser." });
+                    }}
+                    disabled={importing}
+                  >
+                    Dismiss
+                  </Button>
+                </div>
+              </div>
+            </div>
+          )}
+
           {!loading && firstReport && (
             <div className="shrink-0 border-b border-border bg-background px-6 py-2 shadow-sm">
               <div className="grid grid-cols-1 max-w-xl gap-2">
@@ -1030,12 +1240,16 @@ export default function JiraTickets() {
                     </div>
                     <p className="text-[10px] text-muted-foreground truncate mb-0.5">{formatReportDate(firstReport)}</p>
                     <p className="text-lg font-bold text-foreground mb-1">Total: {firstReportStats.total} alerts</p>
-                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-x-2 gap-y-0.5 text-xs">
+                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-x-2 gap-y-0.5 text-xs">
                       <span className="text-muted-foreground">Open:</span>
                       <span className="font-medium text-foreground">{firstReportStats.open}</span>
                       <span className="text-muted-foreground">Closed:</span>
                       <span className="font-medium text-foreground">{firstReportStats.closed}</span>
+                      <span className="text-muted-foreground">Merged:</span>
+                      <span className="font-medium text-foreground">{firstReportStats.merged}</span>
                       <span className="text-muted-foreground">Pending:</span>
+                      <span className="font-medium text-foreground">{firstReportStats.pending}</span>
+                      <span className="text-muted-foreground">In progress:</span>
                       <span className="font-medium text-foreground">{firstReportStats.inProgress}</span>
                       <span className="text-muted-foreground">Incident Auto Closed:</span>
                       <span className="font-medium text-foreground">{firstReportStats.incidentAutoClosed}</span>
@@ -1050,7 +1264,7 @@ export default function JiraTickets() {
             {error && (
               <div className="mx-6 mt-4 rounded-lg border border-destructive/50 bg-destructive/10 px-4 py-3 text-sm text-destructive flex items-center justify-between gap-4">
                 <span>{error}</span>
-                {(error.toLowerCase().includes("reconnect") || error.toLowerCase().includes("expired")) && (
+                {(error.toLowerCase().includes("reconnect") || error.toLowerCase().includes("expired") || error.toLowerCase().includes("authentication")) && (
                   <Button variant="outline" size="sm" onClick={() => { window.location.href = `${API_BASE_URL}/auth/google`; }}>
                     Reconnect Gmail
                   </Button>
@@ -1058,9 +1272,16 @@ export default function JiraTickets() {
               </div>
             )}
 
+            {loading && emails.length === 0 && (
+              <div className="px-6 py-10 flex items-center gap-3 text-sm text-muted-foreground">
+                <RefreshCw className="h-4 w-4 animate-spin" />
+                Loading daily alerts from the database…
+              </div>
+            )}
+
             {!loading && firstReport && csvForTable && transformedData && (
               <section className="p-6">
-                <Card key={rowKeyScope || firstReport.id} className="overflow-hidden">
+                <Card key={firstReport.id} className="overflow-hidden">
                   <CardHeader className="py-3 px-4 bg-muted/30 border-b">
                     <div className="flex items-start justify-between gap-4">
                       <div className="min-w-0">
@@ -1110,7 +1331,7 @@ export default function JiraTickets() {
                     <CsvDataTable
                       csv={csvForTable}
                       onRowClick={(row) => {
-                        const idx = Number((row as Record<string, unknown>).__rowIndex);
+                        const idx = parseJiraTableRowIndex(row);
                         if (!Number.isNaN(idx) && transformedData.rows[idx]) {
                           handleAlertRowClick(transformedData.rows[idx].original);
                         }
@@ -1118,17 +1339,11 @@ export default function JiraTickets() {
                       statusOverrides={resolvedStatusOverrides}
                       closureCommentsOverrides={resolvedClosureCommentsOverrides}
                       closureDateOverrides={resolvedClosureDateOverrides}
-                      getRowKey={(row) => {
-                        const idx = Number((row as Record<string, unknown>).__rowIndex);
-                        if (Number.isNaN(idx) || !transformedData.rows[idx]) return "";
-                        return getRowKey(rowKeyScope)(transformedData.rows[idx].original);
-                      }}
+                      getRowKey={getRowKey}
                       firstColumn={{
                         header: "Jira",
                         render: (row) => {
-                          const idx = Number((row as Record<string, unknown>).__rowIndex);
-                          const original = Number.isNaN(idx) ? null : transformedData.rows[idx]?.original;
-                          const key = original ? getRowKey(rowKeyScope)(original) : "";
+                          const key = getRowKey(row);
                           const jiraKey = key ? resolvedCreatedJiraKeys[key] : "";
                           return <span className="font-mono text-xs">{jiraKey || "—"}</span>;
                         },
@@ -1136,9 +1351,9 @@ export default function JiraTickets() {
                       leadingColumn={{
                         header: "Fetch status",
                         render: (row) => {
-                          const idx = Number((row as Record<string, unknown>).__rowIndex);
+                          const idx = parseJiraTableRowIndex(row);
                           const original = Number.isNaN(idx) ? null : transformedData.rows[idx]?.original;
-                          const rowKey = original ? getRowKey(rowKeyScope)(original) : "";
+                          const rowKey = original ? getRowKey(row) : "";
                           const isFetching = fetchingStatusKey === rowKey;
                           return (
                             <Button
@@ -1147,7 +1362,7 @@ export default function JiraTickets() {
                               disabled={isFetching || fetchingAllStatus}
                               onClick={(e) => {
                                 e.stopPropagation();
-                                if (original) handleFetchLatestStatus(original);
+                                if (original && !Number.isNaN(idx)) handleFetchLatestStatus(original, idx);
                               }}
                               title="Check latest email for closure comment (e.g. please close this alert)"
                             >
@@ -1157,30 +1372,28 @@ export default function JiraTickets() {
                         },
                       }}
                       onStatusChange={(row, newStatus) => {
-                        const idx = Number((row as Record<string, unknown>).__rowIndex);
+                        const idx = parseJiraTableRowIndex(row);
                         if (!Number.isNaN(idx) && transformedData.rows[idx]) {
-                          handleStatusChange(transformedData.rows[idx].original, newStatus, rowKeyScope);
+                          void handleStatusChange(idx, newStatus);
                         }
                       }}
                       onClosureCommentsChange={(row, newValue) => {
-                        const idx = Number((row as Record<string, unknown>).__rowIndex);
+                        const idx = parseJiraTableRowIndex(row);
                         if (!Number.isNaN(idx) && transformedData.rows[idx]) {
-                          handleClosureCommentsChange(transformedData.rows[idx].original, newValue, rowKeyScope);
+                          void handleClosureCommentsChange(idx, newValue);
                         }
                       }}
                       onClosureDateChange={(row, newValue) => {
-                        const idx = Number((row as Record<string, unknown>).__rowIndex);
+                        const idx = parseJiraTableRowIndex(row);
                         if (!Number.isNaN(idx) && transformedData.rows[idx]) {
-                          handleClosureDateChange(transformedData.rows[idx].original, newValue, rowKeyScope);
+                          void handleClosureDateChange(idx, newValue);
                         }
                       }}
                       actionColumn={{
                         header: "Create in Jira",
                         render: (row) => {
                           const rowId = String((row as Record<string, unknown>).__rowIndex ?? "");
-                          const idx = Number((row as Record<string, unknown>).__rowIndex);
-                          const original = transformedData.rows[idx]?.original;
-                          const rowKey = original ? getRowKey(rowKeyScope)(original) : "";
+                          const rowKey = getRowKey(row);
                           const effectiveStatus = (rowKey && resolvedStatusOverrides[rowKey]) ? resolvedStatusOverrides[rowKey] : (row.Status ?? "");
                           const isCreating = jiraCreatingKey === rowId;
                           return (
@@ -1194,7 +1407,7 @@ export default function JiraTickets() {
                                 const effectiveClosureDate = (rowKey && resolvedClosureDateOverrides[rowKey])
                                   ? resolvedClosureDateOverrides[rowKey]
                                   : (row["Closure date"] ?? "");
-                                handleCreateInJira(row, effectiveStatus, rowKey, effectiveClosure, effectiveClosureDate);
+                                handleCreateInJira(row, effectiveStatus, effectiveClosure, effectiveClosureDate);
                               }}
                             >
                               {isCreating ? "Creating…" : "Create"}
@@ -1214,13 +1427,13 @@ export default function JiraTickets() {
 
             {!loading && emails.length > 0 && emailsWithCsv.length === 0 && (
               <p className="px-6 py-4 text-sm text-muted-foreground">
-                No CSV attachments found in the loaded emails. Ensure PB Daily report emails include a .csv file.
+                No CSV attachments found in the loaded emails. Click <strong>Refresh</strong> to pull the latest from Gmail.
               </p>
             )}
 
             {!loading && emails.length === 0 && !error && (
               <p className="px-6 py-4 text-sm text-muted-foreground">
-                Select a month and click <strong>Refresh</strong> to load PB Daily reports. This page shows only the <strong>first report</strong> (earliest date) in the month.
+                Select a month and click <strong>Refresh</strong> to load PB Daily reports into the database. Status changes, closure comments, and Jira ticket IDs are saved server-side so they survive page reloads and project restarts.
               </p>
             )}
           </div>
