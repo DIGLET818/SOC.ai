@@ -40,6 +40,9 @@ __pycache__/
 *.pyo
 Backend/__pycache__/
 
+# Local SQLite data (do not commit)
+Backend/storage/sentinel.db
+
 # Build outputs
 build/
 .next/
