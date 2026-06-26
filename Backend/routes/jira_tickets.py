@@ -14,6 +14,7 @@ Endpoints (mounted at /api/jira-tickets/* via blueprint):
                                      instead of creating a duplicate)
   POST  /api/jira-tickets/link       record an existing Jira key for a row
                                      (used by "Link existing Jira tickets")
+  POST  /api/jira-tickets/match-tokens  search Jira by INC/CS in issue summary
   POST  /api/jira-tickets/import     bulk import legacy localStorage map
 
 All endpoints require an authenticated session (workspace rule: PII-touching
@@ -309,6 +310,53 @@ def link_jira_ticket():
         return jsonify({"error": f"Link failed: {exc}"}), 500
     finally:
         db.close()
+
+
+# ---------------------------------------------------------------------------
+# POST /api/jira-tickets/match-tokens
+# ---------------------------------------------------------------------------
+
+@jira_tickets_bp.post("/match-tokens")
+@require_auth
+def match_jira_tokens():
+    """
+    Search Jira by INC/CS token in issue summary (targeted JQL per token).
+    Body: { "tokens": ["INC13108811", ...], "max_per_token": optional (default 5) }
+    """
+    try:
+        from jira_client import search_issues_by_summary_tokens
+    except ImportError:
+        return jsonify({"error": "Jira client not available"}), 503
+
+    body = request.get_json(silent=True) or {}
+    tokens = body.get("tokens") or []
+    if not isinstance(tokens, list):
+        return jsonify({"error": "tokens must be an array"}), 400
+    try:
+        max_per = min(int(body.get("max_per_token", 5)), 20)
+    except (TypeError, ValueError):
+        max_per = 5
+    cleaned = [t for t in tokens if isinstance(t, str) and t.strip()]
+    if len(cleaned) > 500:
+        return jsonify({"error": "Too many tokens (max 500)"}), 400
+    try:
+        matches = search_issues_by_summary_tokens(cleaned, max_per_token=max_per)
+        tokens_with_hits = sum(1 for v in matches.values() if v)
+        return jsonify({
+            "matches": matches,
+            "stats": {
+                "tokens_searched": len(matches),
+                "tokens_with_hits": tokens_with_hits,
+            },
+        })
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except RuntimeError as e:
+        print("Jira match_tokens failed:", e, flush=True)
+        return jsonify({"error": str(e)}), 502
+    except Exception as e:
+        print("Jira match_tokens error:", e, flush=True)
+        return jsonify({"error": str(e)}), 500
 
 
 # ---------------------------------------------------------------------------

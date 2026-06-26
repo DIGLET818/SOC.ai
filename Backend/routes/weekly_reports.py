@@ -13,11 +13,14 @@ Endpoints (mounted at /api/weekly-reports/* via blueprint):
   POST /api/weekly-reports/sync                        -> fetch from Gmail + upsert
   PATCH /api/weekly-reports/rows/<msg_id>/<row_idx>    -> upsert one override
   POST /api/weekly-reports/overrides/import            -> bulk import from localStorage
+  POST /api/weekly-reports/overrides/bulk              -> upsert many overrides (Fetch all)
+  POST /api/weekly-reports/fetch-closure-batch         -> Gmail lookup + DB persist (Fetch all)
 """
 from __future__ import annotations
 
 import json
-from datetime import datetime
+import time
+from datetime import date, datetime
 from typing import Any, Iterable
 
 from flask import Blueprint, jsonify, request, g
@@ -34,6 +37,57 @@ from models.db_models import (
 
 
 weekly_bp = Blueprint("weekly_reports", __name__)
+
+FETCH_CLOSURE_BATCH_MAX = 5
+FETCH_CLOSURE_ITEM_DELAY_S = 0.45
+
+
+def _gmail_latest_status_payload(search_text: str, *, newer_days: int = 400) -> dict[str, Any]:
+    """Resolve via app config (set in main.py) to avoid circular imports."""
+    from flask import current_app
+
+    fn = current_app.config.get("GMAIL_CLOSURE_RESOLVER")
+    if fn is None:
+        raise RuntimeError("Gmail closure resolver not registered on app")
+    return fn(search_text, newer_days=newer_days)
+
+
+def _bulk_upsert_overrides(
+    db,
+    user: User,
+    message_id: str,
+    entries: list[tuple[int, str, str]],
+) -> int:
+    """Upsert (row_index, field, value) tuples; overwrites existing values. Returns count written."""
+    written = 0
+    now = datetime.utcnow()
+    for row_index, field, value in entries:
+        if field not in ALLOWED_OVERRIDE_FIELDS or row_index < 0:
+            continue
+        stmt = select(WeeklyReportOverride).where(
+            and_(
+                WeeklyReportOverride.message_id == message_id,
+                WeeklyReportOverride.row_index == row_index,
+                WeeklyReportOverride.field == field,
+            )
+        )
+        existing = db.execute(stmt).scalar_one_or_none()
+        if existing is None:
+            db.add(
+                WeeklyReportOverride(
+                    message_id=message_id,
+                    row_index=row_index,
+                    field=field,
+                    value=value,
+                    updated_by_user_id=user.id,
+                )
+            )
+        else:
+            existing.value = value
+            existing.updated_by_user_id = user.id
+            existing.updated_at = now
+        written += 1
+    return written
 
 
 WEEKLY_REPORTS_SENDER = "PB_weekly@global.ntt"
@@ -64,6 +118,65 @@ def _parse_yyyymmdd(s: str | None) -> datetime | None:
         return datetime.strptime(s, "%Y-%m-%d")
     except ValueError:
         return None
+
+
+def _as_date(d: datetime | date) -> date:
+    return d.date() if isinstance(d, datetime) else d
+
+
+def _build_weekly_gmail_query(after: datetime | date, before: datetime | date) -> str:
+    """
+    Gmail search for PB Weekly report messages.
+
+    Do not rely on `from:PB_weekly@global.ntt` alone — messages often show as
+    "'NTT SOAR' via PB SOC" with a different envelope From. Subject + CSV is stable.
+    """
+    a = _as_date(after)
+    b = _as_date(before)
+    return (
+        f'subject:"{WEEKLY_REPORTS_SUBJECT}" has:attachment filename:csv '
+        f"after:{a.year}/{a.month}/{a.day} "
+        f"before:{b.year}/{b.month}/{b.day}"
+    )
+
+
+def _is_pb_weekly_message(em: dict[str, Any]) -> bool:
+    subj = (em.get("subject") or "").strip().lower()
+    if WEEKLY_REPORTS_SUBJECT.lower() not in subj and "pb weekly" not in subj:
+        return False
+    csv = em.get("csvAttachment") or {}
+    rows = csv.get("rows") or []
+    return isinstance(rows, list) and len(rows) > 0
+
+
+def _pull_gmail_weekly(
+    after: datetime | date, before: datetime | date, max_results: int
+) -> list[dict[str, Any]]:
+    try:
+        from auth.gmail_auth import is_gmail_connected, remove_token
+        from email_client.gmail_client import fetch_recent_alerts
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError(f"Gmail not configured on server: {exc}") from exc
+
+    if not is_gmail_connected():
+        raise PermissionError("Not connected. Reconnect Gmail first via /api/auth/google")
+
+    query = _build_weekly_gmail_query(after, before)
+    try:
+        raw = fetch_recent_alerts(
+            query=query, max_results=max_results, include_csv_attachments=True
+        )
+        return [em for em in raw if _is_pb_weekly_message(em)]
+    except Exception as exc:
+        if "invalid_grant" in str(exc).lower():
+            try:
+                remove_token()
+            except Exception:
+                pass
+            raise PermissionError(
+                "Gmail sign-in expired. Please reconnect Gmail."
+            ) from exc
+        raise
 
 
 def _internal_date_ms(email: dict[str, Any]) -> int | None:
@@ -231,34 +344,25 @@ def sync_weekly_reports():
         max_results = 2000
     max_results = max(1, min(max_results, 5000))
 
-    # Guard against missing Gmail config -- mirrors the old endpoints.
-    try:
-        from auth.gmail_auth import is_gmail_connected, remove_token
-        from email_client.gmail_client import fetch_recent_alerts
-    except Exception as exc:  # pragma: no cover - import time guard
-        return jsonify({"error": f"Gmail not configured on server: {exc}"}), 503
+    from email_client.gmail_client import is_transient_gmail_error
 
-    if not is_gmail_connected():
-        return jsonify({"error": "Not connected. Reconnect Gmail first via /api/auth/google"}), 401
-
-    query = (
-        f'from:{WEEKLY_REPORTS_SENDER} subject:"{WEEKLY_REPORTS_SUBJECT}" '
-        f"after:{after.year}/{after.month}/{after.day} "
-        f"before:{before.year}/{before.month}/{before.day}"
-    )
-
-    try:
-        emails = fetch_recent_alerts(
-            query=query, max_results=max_results, include_csv_attachments=True
-        )
-    except Exception as exc:
-        if "invalid_grant" in str(exc).lower():
-            try:
-                remove_token()
-            except Exception:
-                pass
-            return jsonify({"error": "Gmail sign-in expired. Please reconnect Gmail."}), 401
-        return jsonify({"error": str(exc)}), 500
+    emails = None
+    last_sync_exc: Exception | None = None
+    for attempt in range(4):
+        try:
+            emails = _pull_gmail_weekly(after, before, max_results)
+            break
+        except PermissionError as exc:
+            return jsonify({"error": str(exc)}), 401
+        except RuntimeError as exc:
+            return jsonify({"error": str(exc)}), 503
+        except Exception as exc:
+            last_sync_exc = exc
+            if not is_transient_gmail_error(exc) or attempt >= 3:
+                return jsonify({"error": str(exc)}), 500
+            time.sleep(1.2 * (2**attempt))
+    if emails is None:
+        return jsonify({"error": str(last_sync_exc or "Gmail sync failed")}), 500
 
     user: User = g.current_user
     inserted_emails = 0
@@ -349,6 +453,7 @@ def sync_weekly_reports():
             "updatedEmails": updated_emails,
             "insertedRows": inserted_rows,
             "skippedNoCsv": skipped_no_csv,
+            "gmailQuery": _build_weekly_gmail_query(after, before),
         }
     )
 
@@ -526,3 +631,208 @@ def import_overrides():
             "totalSubmitted": len(items),
         }
     )
+
+
+# ---------------------------------------------------------------------------
+# POST /api/weekly-reports/overrides/bulk
+# ---------------------------------------------------------------------------
+
+@weekly_bp.post("/overrides/bulk")
+@require_auth
+def bulk_upsert_overrides():
+    """
+    Upsert many overrides in one transaction (Fetch-all saves).
+    Unlike /overrides/import, existing values ARE overwritten.
+    Body: { overrides: [{ message_id, row_index, field, value }, ...] }
+    """
+    body = request.get_json(silent=True) or {}
+    items = body.get("overrides")
+    if not isinstance(items, list) or not items:
+        return jsonify({"error": "overrides must be a non-empty list"}), 400
+    if len(items) > 200:
+        return jsonify({"error": "At most 200 overrides per bulk request"}), 400
+
+    user: User = g.current_user
+    db = SessionLocal()
+    try:
+        entries: list[tuple[str, int, str, str]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            mid = str(item.get("message_id") or "").strip()
+            field = str(item.get("field") or "").strip().lower()
+            value = item.get("value")
+            try:
+                idx = int(item.get("row_index"))
+            except (TypeError, ValueError):
+                continue
+            if (
+                not mid
+                or idx < 0
+                or field not in ALLOWED_OVERRIDE_FIELDS
+                or not isinstance(value, str)
+            ):
+                continue
+            entries.append((mid, idx, field, value))
+
+        if not entries:
+            return jsonify({"error": "No valid overrides in request"}), 400
+
+        message_ids = {e[0] for e in entries}
+        known = {
+            row[0]
+            for row in db.execute(
+                select(WeeklyReportEmail.id).where(WeeklyReportEmail.id.in_(message_ids))
+            ).all()
+        }
+        written = 0
+        by_message: dict[str, list[tuple[int, str, str]]] = {}
+        for mid, idx, field, value in entries:
+            if mid not in known:
+                continue
+            by_message.setdefault(mid, []).append((idx, field, value))
+        for mid, group in by_message.items():
+            written += _bulk_upsert_overrides(db, user, mid, group)
+        db.commit()
+        return jsonify({"ok": True, "written": written}), 200
+    except Exception as exc:
+        db.rollback()
+        return jsonify({"error": str(exc)}), 500
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# POST /api/weekly-reports/fetch-closure-batch
+# ---------------------------------------------------------------------------
+
+@weekly_bp.post("/fetch-closure-batch")
+@require_auth
+def fetch_closure_batch():
+    """
+    Gmail closure lookup + DB persist for up to 10 rows in one HTTP request.
+    Body: {
+      message_id: str,
+      newer_than_days?: int,
+      items: [{ row_index: int, queries: string[] }]
+    }
+    """
+    try:
+        from auth.gmail_auth import is_gmail_connected
+    except ImportError:
+        return jsonify({"error": "Gmail not configured"}), 503
+    if not is_gmail_connected():
+        return jsonify({"error": "Not connected. Connect Gmail first."}), 401
+
+    body = request.get_json(silent=True) or {}
+    message_id = str(body.get("message_id") or "").strip()
+    items = body.get("items")
+    newer_days = max(1, min(int(body.get("newer_than_days", 400)), 450))
+    if not message_id:
+        return jsonify({"error": "message_id is required"}), 400
+    if not isinstance(items, list) or not items:
+        return jsonify({"error": "items must be a non-empty list"}), 400
+    if len(items) > FETCH_CLOSURE_BATCH_MAX:
+        return jsonify({"error": f"At most {FETCH_CLOSURE_BATCH_MAX} items per batch"}), 400
+
+    user: User = g.current_user
+    db = SessionLocal()
+    try:
+        email = db.get(WeeklyReportEmail, message_id)
+        if email is None:
+            return jsonify({"error": "unknown message_id; sync this report first"}), 404
+
+        results: list[dict[str, Any]] = []
+        override_entries: list[tuple[int, str, str]] = []
+        rows_updated = 0
+        dates_set = 0
+
+        for idx_item, item in enumerate(items):
+            if not isinstance(item, dict):
+                results.append({"rowIndex": None, "error": "invalid item"})
+                continue
+            try:
+                row_index = int(item.get("row_index"))
+            except (TypeError, ValueError):
+                results.append({"rowIndex": None, "error": "row_index must be int"})
+                continue
+            raw_queries = item.get("queries") or []
+            if isinstance(raw_queries, str):
+                raw_queries = [raw_queries]
+            queries: list[str] = []
+            seen: set[str] = set()
+            for q in raw_queries:
+                t = str(q).strip()
+                if t and t not in seen:
+                    seen.add(t)
+                    queries.append(t)
+
+            row_result: dict[str, Any] = {
+                "rowIndex": row_index,
+                "suggestedStatus": None,
+                "suggestedClosureComment": None,
+                "matchedEmailDateIso": None,
+                "persisted": False,
+            }
+            last_error: str | None = None
+            payload: dict[str, Any] | None = None
+            had_successful_lookup = False
+            for q in queries:
+                try:
+                    payload = _gmail_latest_status_payload(q, newer_days=newer_days)
+                    had_successful_lookup = True
+                    row_result.update(
+                        {
+                            k: payload.get(k)
+                            for k in (
+                                "suggestedStatus",
+                                "suggestedClosureComment",
+                                "matchedEmailDateIso",
+                            )
+                        }
+                    )
+                    if payload.get("notFound"):
+                        row_result["notFound"] = True
+                    if payload.get("suggestedStatus"):
+                        break
+                except Exception as exc:
+                    last_error = str(exc)
+            if not had_successful_lookup and last_error:
+                row_result["error"] = last_error
+
+            status = row_result.get("suggestedStatus")
+            if status in ("Closed", "Incident Auto Closed"):
+                status_to_set = (
+                    "Incident Auto Closed" if status == "Incident Auto Closed" else "Closed"
+                )
+                closure = (row_result.get("suggestedClosureComment") or "").strip() or "Closed from email"
+                date_iso = (row_result.get("matchedEmailDateIso") or "").strip()
+                override_entries.append((row_index, "status", status_to_set))
+                override_entries.append((row_index, "closure_comment", closure))
+                if date_iso:
+                    override_entries.append((row_index, "closure_date", date_iso))
+                    dates_set += 1
+                row_result["persisted"] = True
+                rows_updated += 1
+
+            results.append(row_result)
+            if idx_item < len(items) - 1:
+                time.sleep(FETCH_CLOSURE_ITEM_DELAY_S)
+
+        if override_entries:
+            _bulk_upsert_overrides(db, user, message_id, override_entries)
+        db.commit()
+        return jsonify(
+            {
+                "ok": True,
+                "results": results,
+                "updated": rows_updated,
+                "datesSet": dates_set,
+            }
+        ), 200
+    except Exception as exc:
+        db.rollback()
+        print("fetch-closure-batch error:", exc, flush=True)
+        return jsonify({"error": str(exc)}), 500
+    finally:
+        db.close()

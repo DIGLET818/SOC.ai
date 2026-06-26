@@ -9,7 +9,7 @@
  * Google account that completed OAuth (workspace rule: PII responses must
  * require strong auth).
  */
-import { API_BASE_URL } from "./client";
+import { API_BASE_URL, waitForBackend } from "./client";
 import type { CsvAttachment, GmailMessage } from "@/types/gmail";
 
 /** Override fields recognised by the server. */
@@ -155,6 +155,47 @@ export async function syncDailyAlerts(params: {
   });
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function isRetryableDailySyncError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const m = err.message.toLowerCase();
+  return (
+    m.includes("failed to fetch") ||
+    m.includes("networkerror") ||
+    m.includes("connection refused") ||
+    m.includes("connection reset") ||
+    m.includes("connection aborted") ||
+    m.includes("10053") ||
+    m.includes("10054") ||
+    m.includes("503") ||
+    m.includes("502") ||
+    m.includes("429") ||
+    m.includes("sync failed")
+  );
+}
+
+/** Retry Daily Alerts Gmail sync when the backend or Gmail connection drops mid-run. */
+export async function syncDailyAlertsResilient(
+  params: Parameters<typeof syncDailyAlerts>[0],
+  maxAttempts = 4
+): Promise<DailyAlertsSyncResponse> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      if (attempt > 0) await sleep(2500 * attempt);
+      return await syncDailyAlerts(params);
+    } catch (e) {
+      lastErr = e;
+      if (!isRetryableDailySyncError(e) || attempt === maxAttempts - 1) throw e;
+      await waitForBackend(25_000, 5_000);
+    }
+  }
+  throw lastErr;
+}
+
 /** Upsert a single override (status / closure_comment / closure_date). */
 export async function upsertDailyOverride(params: {
   messageId: string;
@@ -180,4 +221,121 @@ export async function importDailyOverrides(
     method: "POST",
     jsonBody: { overrides },
   });
+}
+
+export interface RecoverDailyReportCandidate {
+  messageId: string;
+  subject: string | null;
+  receivedDate: string | null;
+  reportDate: string | null;
+  rowCount: number;
+}
+
+export interface RecoverDailyReportResponse {
+  ok: true;
+  reportDate: string;
+  searchAfter: string;
+  searchBefore: string;
+  assigned: boolean;
+  assignedMessageId: string | null;
+  candidates: RecoverDailyReportCandidate[];
+  syncedEmails: number;
+  skippedNoCsv: number;
+}
+
+/** Search Gmail for a late daily report and optionally assign it to a calendar day. */
+export async function recoverDailyReport(params: {
+  reportDate: string;
+  searchDays?: number;
+  messageId?: string;
+}): Promise<RecoverDailyReportResponse> {
+  return call<RecoverDailyReportResponse>("/daily-alerts/recover", {
+    method: "POST",
+    jsonBody: {
+      report_date: params.reportDate,
+      search_days: params.searchDays,
+      message_id: params.messageId,
+    },
+  });
+}
+
+export async function setDailyReportDate(params: {
+  messageId: string;
+  reportDate: string | null;
+}): Promise<{ ok: true; messageId: string; reportDate: string | null; receivedDate: string | null }> {
+  return call(`/daily-alerts/emails/${encodeURIComponent(params.messageId)}/report-date`, {
+    method: "PATCH",
+    jsonBody: { report_date: params.reportDate },
+  });
+}
+
+/** Upload parsed headers + rows (from .csv or .xlsx on the client). */
+export async function uploadDailyReportData(params: {
+  reportDate: string;
+  filename: string;
+  headers: string[];
+  rows: Record<string, string>[];
+  replace?: boolean;
+}): Promise<{
+  ok: true;
+  messageId: string;
+  reportDate: string;
+  rowCount: number;
+  insertedEmails: number;
+  updatedEmails: number;
+}> {
+  return call("/daily-alerts/upload-data", {
+    method: "POST",
+    jsonBody: {
+      report_date: params.reportDate,
+      filename: params.filename,
+      headers: params.headers,
+      rows: params.rows,
+      replace: params.replace ? "1" : undefined,
+    },
+  });
+}
+
+export async function uploadDailyReportCsv(params: {
+  reportDate: string;
+  file: File;
+  replace?: boolean;
+}): Promise<{
+  ok: true;
+  messageId: string;
+  reportDate: string;
+  rowCount: number;
+  insertedEmails: number;
+  updatedEmails: number;
+}> {
+  const form = new FormData();
+  form.append("report_date", params.reportDate);
+  form.append("file", params.file);
+  if (params.replace) form.append("replace", "1");
+
+  const resp = await fetch(`${API_BASE_URL}/daily-alerts/upload`, {
+    method: "POST",
+    credentials: "include",
+    body: form,
+  });
+  if (resp.status === 401) throw new DailyAlertsAuthError();
+  if (!resp.ok) {
+    const text = await resp.text();
+    let msg = text;
+    try {
+      const j = JSON.parse(text) as { error?: string };
+      if (j.error) msg = j.error;
+    } catch {
+      /* keep raw */
+    }
+    throw new Error(`API error (${resp.status}): ${msg}`);
+  }
+  return JSON.parse(await resp.text()) as {
+    ok: true;
+    messageId: string;
+    reportDate: string;
+    rowCount: number;
+    insertedEmails: number;
+    updatedEmails: number;
+  };
 }

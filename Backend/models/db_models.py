@@ -189,6 +189,9 @@ class DailyReportEmail(Base):
     subject: Mapped[Optional[str]] = mapped_column(String(998), nullable=True)
     date_header: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     internal_date_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+    # Dashboard calendar date (YYYY-MM-DD). Used when a report arrives late so it
+    # still appears on the day it covers, not the Gmail received date.
+    report_date: Mapped[Optional[str]] = mapped_column(String(10), nullable=True, index=True)
 
     csv_filename: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
     headers_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -315,4 +318,70 @@ class JiraCreatedTicket(Base):
     __table_args__ = (
         UniqueConstraint("message_id", "row_index", name="uq_jct_msg_row"),
         Index("ix_jct_msg_row", "message_id", "row_index"),
+    )
+
+
+class SiemWorkbookStore(Base):
+    """
+    Single shared SIEM Use case workbook (all sheets, rows, month columns).
+
+    Stored as JSON so the dynamic column layout from uploaded Excel/CSV is
+    preserved without a wide normalised schema. One row (`id='default'`) for
+    the team; survives browser refresh and backend restarts.
+    """
+
+    __tablename__ = "siem_workbook_store"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    workbook_json: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_by_user_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
+
+    updated_by_user: Mapped[Optional[User]] = relationship()
+
+
+class GmailRuleHitsCache(Base):
+    """
+    Cache of Gmail mailbox hit counts for SIEM rule names across a date window.
+
+    Keyed by (rule_name, after_date, before_date, from_filter) so repeated scans
+    don't re-query Gmail unless explicitly forced.
+    """
+
+    __tablename__ = "gmail_rule_hits_cache"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    rule_name: Mapped[str] = mapped_column(String(500), nullable=False, index=True)
+    after_date: Mapped[str] = mapped_column(String(10), nullable=False, index=True)  # YYYY-MM-DD
+    before_date: Mapped[str] = mapped_column(String(10), nullable=False, index=True)  # YYYY-MM-DD
+    from_filter: Mapped[Optional[str]] = mapped_column(String(320), nullable=True, index=True)
+
+    match_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    capped_at_max: Mapped[int] = mapped_column(Integer, nullable=False, default=0)  # 0/1
+    gmail_query: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    search_token: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    sample_subjects_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "rule_name",
+            "after_date",
+            "before_date",
+            "from_filter",
+            name="uq_gmail_rule_hits_key",
+        ),
+        Index(
+            "ix_gmail_rule_hits_window",
+            "after_date",
+            "before_date",
+            "from_filter",
+        ),
     )

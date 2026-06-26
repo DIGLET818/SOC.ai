@@ -7,6 +7,7 @@ Portal Closure_Comments → Jira issue Comments (REST comment). Portal Closure d
 import os
 import re
 import base64
+import time
 import requests
 from datetime import datetime, timezone
 
@@ -346,7 +347,7 @@ def _issues_from_search_payload(data: dict) -> list:
 
 def _search_issues_jql_enhanced(base_url: str, headers: dict, jql: str, max_results: int) -> list | None:
     """
-    Jira Cloud enhanced search GET /rest/api/3/search/jql with nextPageToken pagination.
+    Jira Cloud enhanced search POST /rest/api/3/search/jql with nextPageToken pagination.
     Returns None if the endpoint is missing (caller falls back to classic /search).
     """
     url = f"{base_url}/rest/api/3/search/jql"
@@ -355,11 +356,22 @@ def _search_issues_jql_enhanced(base_url: str, headers: dict, jql: str, max_resu
     first_request = True
     while len(collected) < max_results:
         batch = min(100, max_results - len(collected))
-        params: dict = {"jql": jql, "maxResults": batch, "fields": "summary,status"}
+        body: dict = {
+            "jql": jql,
+            "maxResults": batch,
+            "fields": ["summary", "status"],
+        }
         if next_token:
-            params["nextPageToken"] = next_token
+            body["nextPageToken"] = next_token
         try:
-            resp = requests.get(url, params=params, headers=headers, timeout=60)
+            resp = requests.post(url, headers=headers, json=body, timeout=60)
+            if first_request and resp.status_code in (404, 405, 410):
+                return None
+            if first_request and resp.status_code == 400:
+                params: dict = {"jql": jql, "maxResults": batch, "fields": "summary,status"}
+                if next_token:
+                    params["nextPageToken"] = next_token
+                resp = requests.get(url, params=params, headers=headers, timeout=60)
         except requests.exceptions.RequestException as e:
             raise RuntimeError(f"Jira request failed: {e}") from e
         if resp.status_code != 200:
@@ -439,3 +451,89 @@ def search_issues(max_results: int = 200) -> list:
 
     classic = _search_issues_classic(base_url, headers, jql, cap)
     return classic[:cap]
+
+
+def _sanitize_jql_summary_token(raw: str) -> str | None:
+    """Allow INC/CS ids and numeric ServiceNow tokens for summary ~ search."""
+    token = (raw or "").strip()
+    if not token or len(token) > 64:
+        return None
+    upper = token.upper()
+    if re.match(r"^INC\d{5,}$", upper):
+        return upper
+    if re.match(r"^CS\d{5,}$", upper):
+        return upper
+    if re.match(r"^\d{6,}$", token):
+        return token
+    return None
+
+
+def _escape_jql_string(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _jql_variants_for_token(project_key: str, token: str) -> list[str]:
+    """Multiple JQL strategies — summary, text (description), and wildcard."""
+    escaped = _escape_jql_string(token)
+    pk = project_key.strip()
+    return [
+        f'project = {pk} AND text ~ "{escaped}" ORDER BY created DESC',
+        f'project = {pk} AND summary ~ "{escaped}*" ORDER BY created DESC',
+        f'project = {pk} AND summary ~ "{escaped}" ORDER BY created DESC',
+    ]
+
+
+def _search_jql_first_hit(
+    base_url: str, headers: dict, jql_list: list[str], max_results: int
+) -> list:
+    for jql in jql_list:
+        enhanced = _search_issues_jql_enhanced(base_url, headers, jql, max_results)
+        if enhanced:
+            return enhanced[:max_results]
+        if enhanced is None:
+            try:
+                classic = _search_issues_classic(base_url, headers, jql, max_results)
+                if classic:
+                    return classic[:max_results]
+            except RuntimeError:
+                continue
+    return []
+
+
+def search_issues_by_summary_tokens(tokens: list[str], max_per_token: int = 5) -> dict[str, list]:
+    """
+    For each token (INC/CS id), search Jira issues whose summary contains that token.
+    Returns { "INC123456": [{ key, summary, status }, ...], ... } — no 1500-issue cap needed.
+    """
+    base_url = _env("JIRA_BASE_URL").rstrip("/")
+    email = _env("JIRA_EMAIL")
+    api_token = _env("JIRA_API_TOKEN")
+    project_key = _env("JIRA_PROJECT_KEY")
+    if not base_url or not email or not api_token or not project_key:
+        raise ValueError(
+            "Set JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY (see docs/JIRA_SETUP.md)"
+        )
+    auth = base64.b64encode(f"{email}:{api_token}".encode()).decode()
+    headers = _get_headers(auth)
+
+    per = min(max(1, int(max_per_token)), 20)
+    out: dict[str, list] = {}
+    seen_queries: set[str] = set()
+
+    for raw in tokens:
+        if not isinstance(raw, str):
+            continue
+        token = _sanitize_jql_summary_token(raw)
+        if not token:
+            continue
+        key = token.lower()
+        if key in out or key in seen_queries:
+            continue
+        seen_queries.add(key)
+
+        jql_list = _jql_variants_for_token(project_key, token)
+        hits = _search_jql_first_hit(base_url, headers, jql_list, per)
+        out[key] = hits
+        time.sleep(0.08)
+
+    return out

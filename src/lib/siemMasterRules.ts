@@ -1,6 +1,8 @@
 /**
- * Read rule names from the SIEM Master sheet stored in localStorage (same workbook as SIEM Use case page).
+ * Read rule names from the SIEM Master sheet (DB-backed workbook or legacy localStorage).
  */
+import { getSiemWorkbook } from "@/api/siemWorkbook";
+
 export const SIEM_WORKBOOK_STORAGE_KEY = "siemWorkbookV2";
 
 export interface SiemWorkbookSheetLite {
@@ -54,12 +56,69 @@ export function collectUniqueRuleNames(sheet: SiemWorkbookSheetLite, ruleCol: st
   return list;
 }
 
-export function loadSiemMasterRuleNamesFromStorage(): {
+export type SiemMasterRuleInfo = {
   sheetName: string;
   ruleColumn: string;
   rules: string[];
   error?: string;
-} {
+};
+
+export function siemMasterInfoFromSheets(sheets: SiemWorkbookSheetLite[]): SiemMasterRuleInfo {
+  if (!sheets?.length) {
+    return {
+      sheetName: "",
+      ruleColumn: "",
+      rules: [],
+      error: "No SIEM workbook loaded. Upload a workbook on SIEM Use case first.",
+    };
+  }
+  const master = findSiemMasterSheet(sheets);
+  if (!master) {
+    return {
+      sheetName: "",
+      ruleColumn: "",
+      rules: [],
+      error: 'No sheet named "SIEM Master" found. Add or rename a sheet to match SIEM Master.',
+    };
+  }
+  const col = findRuleNameColumn(master.columns);
+  if (!col) {
+    return {
+      sheetName: master.name,
+      ruleColumn: "",
+      rules: [],
+      error: 'No "Rule Name" column found on SIEM Master sheet.',
+    };
+  }
+  const rules = collectUniqueRuleNames(master, col);
+  if (!rules.length) {
+    return {
+      sheetName: master.name,
+      ruleColumn: col,
+      rules: [],
+      error: "SIEM Master has no non-empty rule names in that column.",
+    };
+  }
+  return { sheetName: master.name, ruleColumn: col, rules };
+}
+
+/** Load SIEM Master rules from the server workbook (SQLite). */
+export async function loadSiemMasterRuleNamesFromApi(): Promise<SiemMasterRuleInfo> {
+  try {
+    const wb = await getSiemWorkbook();
+    const sheets: SiemWorkbookSheetLite[] = (wb.sheets ?? []).map((s) => ({
+      name: s.name,
+      columns: s.columns,
+      rows: s.rows as Record<string, string>[],
+    }));
+    return siemMasterInfoFromSheets(sheets);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return { sheetName: "", ruleColumn: "", rules: [], error: msg };
+  }
+}
+
+export function loadSiemMasterRuleNamesFromStorage(): SiemMasterRuleInfo {
   try {
     const raw = localStorage.getItem(SIEM_WORKBOOK_STORAGE_KEY);
     if (!raw) {
@@ -69,34 +128,7 @@ export function loadSiemMasterRuleNamesFromStorage(): {
     if (!sheets?.length) {
       return { sheetName: "", ruleColumn: "", rules: [], error: "Could not parse SIEM workbook." };
     }
-    const master = findSiemMasterSheet(sheets);
-    if (!master) {
-      return {
-        sheetName: "",
-        ruleColumn: "",
-        rules: [],
-        error: 'No sheet named "SIEM Master" found. Add or rename a sheet to match SIEM Master.',
-      };
-    }
-    const col = findRuleNameColumn(master.columns);
-    if (!col) {
-      return {
-        sheetName: master.name,
-        ruleColumn: "",
-        rules: [],
-        error: 'No "Rule Name" column found on SIEM Master sheet.',
-      };
-    }
-    const rules = collectUniqueRuleNames(master, col);
-    if (!rules.length) {
-      return {
-        sheetName: master.name,
-        ruleColumn: col,
-        rules: [],
-        error: "SIEM Master has no non-empty rule names in that column.",
-      };
-    }
-    return { sheetName: master.name, ruleColumn: col, rules };
+    return siemMasterInfoFromSheets(sheets);
   } catch {
     return { sheetName: "", ruleColumn: "", rules: [], error: "Failed to read localStorage." };
   }

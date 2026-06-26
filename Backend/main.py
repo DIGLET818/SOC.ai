@@ -27,19 +27,23 @@ try:
     )
     from email_client.gmail_client import (
         fetch_recent_alerts,
+        fetch_recent_alerts_for_status,
         distinctive_rule_text,
         gmail_keyword_fragment,
         rule_search_token,
         search_messages_light,
+        search_latest_incident_for_rule,
     )
     from mappers.gmail_to_alert import gmail_message_to_alert
     GMAIL_AVAILABLE = True
 except Exception as e:
     fetch_recent_alerts = None  # type: ignore
+    fetch_recent_alerts_for_status = None  # type: ignore
     distinctive_rule_text = None  # type: ignore
     gmail_keyword_fragment = None  # type: ignore
     rule_search_token = None  # type: ignore
     search_messages_light = None  # type: ignore
+    search_latest_incident_for_rule = None  # type: ignore
     get_current_account_identity = None  # type: ignore
     GMAIL_AVAILABLE = False
     print("Gmail/OAuth not loaded:", e, flush=True)
@@ -55,6 +59,10 @@ from auth.session import (
 from routes.weekly_reports import weekly_bp
 from routes.daily_alerts import daily_bp
 from routes.jira_tickets import jira_tickets_bp
+from routes.alerts import alerts_bp
+from db import session_scope
+from models.db_models import GmailRuleHitsCache
+from sqlalchemy import select
 
 init_db()
 
@@ -70,10 +78,17 @@ app = Flask(__name__)
 #   /api/weekly-reports/*  -> Weekly Reports page
 #   /api/daily-alerts/*    -> Daily Alerts + Jira Tickets pages (shared rows)
 #   /api/jira-tickets/*    -> per-row Jira ticket mapping (server-side dedupe)
+#   /api/alerts            -> Yearly Data -> Alerts (date / range, hybrid
+#                              daily+weekly source with override merge)
 # `/api/me` is registered separately below using the same auth decorator.
 app.register_blueprint(weekly_bp, url_prefix="/api/weekly-reports")
 app.register_blueprint(daily_bp, url_prefix="/api/daily-alerts")
 app.register_blueprint(jira_tickets_bp, url_prefix="/api/jira-tickets")
+app.register_blueprint(alerts_bp, url_prefix="/api/alerts")
+
+from routes.siem_workbook import siem_workbook_bp  # noqa: E402
+
+app.register_blueprint(siem_workbook_bp, url_prefix="/api/siem-workbook")
 
 # ---------------------------------------------------------------------
 # CORS CONFIG
@@ -455,6 +470,88 @@ def _gmail_rule_hits_query(keyword_fragment: str, after_date: str, before_date: 
     return " ".join(parts)
 
 
+@app.route("/api/gmail/rule-hits-cache/bulk", methods=["POST"])
+def api_gmail_rule_hits_cache_bulk():
+    """
+    POST JSON: {
+      "windows": [{ "month_label": "May 26", "after_date": "YYYY-MM-DD", "before_date": "YYYY-MM-DD" }, ...],
+      "rule_names": optional array (omit for all cached rules in those windows),
+      "from_filter": optional sender email
+    }
+    Returns cached mailbox hit counts (no Gmail API calls).
+    """
+    try:
+        data = request.get_json() or {}
+        windows = data.get("windows") or []
+        rule_names = data.get("rule_names") or []
+        from_filter = (data.get("from_filter") or "").strip()
+
+        if not isinstance(windows, list) or not windows:
+            return jsonify({"error": "windows must be a non-empty array"}), 400
+
+        if from_filter and not re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", from_filter):
+            return jsonify({"error": "from_filter must be a valid email address if provided"}), 400
+
+        filter_rules: list[str] | None = None
+        if isinstance(rule_names, list) and rule_names:
+            filter_rules = []
+            for r in rule_names:
+                if not isinstance(r, str):
+                    continue
+                s = r.strip()
+                if s and len(s) <= 500:
+                    filter_rules.append(s)
+
+        label_by_window: dict[tuple[str, str], str] = {}
+        for w in windows:
+            if not isinstance(w, dict):
+                continue
+            label = str(w.get("month_label") or "").strip()
+            after_date = str(w.get("after_date") or "").strip()
+            before_date = str(w.get("before_date") or "").strip()
+            if not label or not after_date or not before_date:
+                continue
+            try:
+                datetime.strptime(after_date, "%Y-%m-%d")
+                datetime.strptime(before_date, "%Y-%m-%d")
+            except ValueError:
+                continue
+            label_by_window[(after_date, before_date)] = label
+
+        if not label_by_window:
+            return jsonify({"error": "No valid windows in request"}), 400
+
+        hits = []
+        with session_scope() as db:
+            for (after_date, before_date), month_label in label_by_window.items():
+                stmt = select(GmailRuleHitsCache).where(
+                    GmailRuleHitsCache.after_date == after_date,
+                    GmailRuleHitsCache.before_date == before_date,
+                    GmailRuleHitsCache.from_filter == (from_filter or None),
+                )
+                if filter_rules is not None:
+                    stmt = stmt.where(GmailRuleHitsCache.rule_name.in_(filter_rules))
+                rows = db.execute(stmt).scalars().all()
+                for row in rows:
+                    hits.append({
+                        "rule_name": row.rule_name,
+                        "month_label": month_label,
+                        "after_date": after_date,
+                        "before_date": before_date,
+                        "match_count": int(row.match_count or 0),
+                        "capped_at_max": bool(row.capped_at_max),
+                        "cached_at": row.updated_at.isoformat() + "Z" if row.updated_at else None,
+                    })
+
+        return jsonify({
+            "from_filter": from_filter or None,
+            "hits": hits,
+        })
+    except Exception as e:
+        print("gmail/rule-hits-cache/bulk error:", e, flush=True)
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/gmail/rule-hits", methods=["POST"])
 def api_gmail_rule_hits():
     """
@@ -475,6 +572,7 @@ def api_gmail_rule_hits():
         from_filter = (data.get("from_filter") or "").strip()
         max_per = min(int(data.get("max_results_per_rule", 500)), 500)
         sample_n = min(int(data.get("sample_n", 3)), 20)
+        force_refresh = bool(data.get("force_refresh", False))
 
         if not isinstance(rule_names, list):
             return jsonify({"error": "rule_names must be an array"}), 400
@@ -530,6 +628,47 @@ def api_gmail_rule_hits():
                     "error": "Could not derive searchable keywords from rule name (need text after customer id).",
                 })
                 continue
+            # Cache-first: skip Gmail search when we already scanned this rule + window.
+            if not force_refresh:
+                cached_payload = None
+                with session_scope() as db:
+                    cached_row = db.execute(
+                        select(GmailRuleHitsCache).where(
+                            GmailRuleHitsCache.rule_name == rule_name,
+                            GmailRuleHitsCache.after_date == after_date,
+                            GmailRuleHitsCache.before_date == before_date,
+                            GmailRuleHitsCache.from_filter == (from_filter or None),
+                        )
+                    ).scalar_one_or_none()
+                    if cached_row is not None:
+                        mc = int(cached_row.match_count or 0)
+                        sample_subjects = []
+                        try:
+                            sample_subjects = json.loads(cached_row.sample_subjects_json or "[]") or []
+                            if not isinstance(sample_subjects, list):
+                                sample_subjects = []
+                        except Exception:
+                            sample_subjects = []
+                        cached_payload = {
+                            "rule_name": rule_name,
+                            "search_token": cached_row.search_token or display_token,
+                            "gmail_query": cached_row.gmail_query or q,
+                            "match_count": mc,
+                            "capped_at_max": bool(cached_row.capped_at_max),
+                            "sample_subjects": sample_subjects,
+                            **({"error": cached_row.error} if cached_row.error else {}),
+                            "cached": True,
+                            "cached_at": cached_row.updated_at.isoformat() + "Z" if cached_row.updated_at else None,
+                        }
+
+                if cached_payload is not None:
+                    if cached_payload["match_count"] > 0:
+                        rules_with_hits += 1
+                    total_first_page += int(cached_payload["match_count"] or 0)
+                    results.append(cached_payload)
+                    continue
+
+            # Cache miss (or forced): query Gmail and upsert cache row.
             try:
                 info = search_messages_light(
                     q,
@@ -538,6 +677,31 @@ def api_gmail_rule_hits():
                     distinctive_text=distinctive,
                 )
             except Exception as ex:
+                err = str(ex)
+                with session_scope() as db:
+                    existing = db.execute(
+                        select(GmailRuleHitsCache).where(
+                            GmailRuleHitsCache.rule_name == rule_name,
+                            GmailRuleHitsCache.after_date == after_date,
+                            GmailRuleHitsCache.before_date == before_date,
+                            GmailRuleHitsCache.from_filter == (from_filter or None),
+                        )
+                    ).scalar_one_or_none()
+                    if existing is None:
+                        existing = GmailRuleHitsCache(
+                            rule_name=rule_name,
+                            after_date=after_date,
+                            before_date=before_date,
+                            from_filter=(from_filter or None),
+                        )
+                        db.add(existing)
+                    existing.match_count = 0
+                    existing.capped_at_max = 0
+                    existing.gmail_query = q
+                    existing.search_token = display_token
+                    existing.sample_subjects_json = json.dumps([])
+                    existing.error = err
+
                 results.append({
                     "rule_name": rule_name,
                     "search_token": display_token,
@@ -545,21 +709,50 @@ def api_gmail_rule_hits():
                     "match_count": 0,
                     "capped_at_max": False,
                     "sample_subjects": [],
-                    "error": str(ex),
+                    "error": err,
+                    "cached": False,
                 })
                 continue
 
-            mc = info.get("match_count", 0)
+            mc = int(info.get("match_count", 0) or 0)
+            capped = bool(info.get("capped_at_max"))
+            sample_subjects = info.get("sample_subjects") or []
             if mc > 0:
                 rules_with_hits += 1
             total_first_page += mc
+
+            with session_scope() as db:
+                existing = db.execute(
+                    select(GmailRuleHitsCache).where(
+                        GmailRuleHitsCache.rule_name == rule_name,
+                        GmailRuleHitsCache.after_date == after_date,
+                        GmailRuleHitsCache.before_date == before_date,
+                        GmailRuleHitsCache.from_filter == (from_filter or None),
+                    )
+                ).scalar_one_or_none()
+                if existing is None:
+                    existing = GmailRuleHitsCache(
+                        rule_name=rule_name,
+                        after_date=after_date,
+                        before_date=before_date,
+                        from_filter=(from_filter or None),
+                    )
+                    db.add(existing)
+                existing.match_count = mc
+                existing.capped_at_max = 1 if capped else 0
+                existing.gmail_query = q
+                existing.search_token = display_token
+                existing.sample_subjects_json = json.dumps(sample_subjects)
+                existing.error = None
+
             results.append({
                 "rule_name": rule_name,
                 "search_token": display_token,
                 "gmail_query": q,
                 "match_count": mc,
-                "capped_at_max": bool(info.get("capped_at_max")),
-                "sample_subjects": info.get("sample_subjects") or [],
+                "capped_at_max": capped,
+                "sample_subjects": sample_subjects,
+                "cached": False,
             })
 
         zero_hits = len(unique_rules) - rules_with_hits
@@ -583,6 +776,139 @@ def api_gmail_rule_hits():
                 "error": "Gmail sign-in expired or was revoked. Please reconnect Gmail from the Alerts page (click Connect Gmail)."
             }), 401
         print("gmail/rule-hits error:", e, flush=True)
+        return jsonify({"error": err_msg}), 500
+
+
+@app.route("/api/gmail/siem-rule-latest-incidents", methods=["POST"])
+def api_gmail_siem_rule_latest_incidents():
+    """
+    POST JSON: {
+      "items": [{ "rule_name": "...", "row_id": optional, "months": [
+        { "label": "May 26", "after_date": "YYYY-MM-DD", "before_date": "YYYY-MM-DD" }, ...
+      ]}],
+      "from_filter": optional sender email
+    }
+    For each rule and month window, search Gmail and return the newest INC###### from matching subjects.
+    """
+    if not GMAIL_AVAILABLE:
+        return jsonify({"error": "Gmail not configured"}), 503
+    if not is_gmail_connected():
+        return jsonify({"error": "Not connected. Connect Gmail first via /api/auth/google"}), 401
+    try:
+        data = request.get_json() or {}
+        items = data.get("items") or []
+        from_filter = (data.get("from_filter") or "").strip()
+
+        if not isinstance(items, list):
+            return jsonify({"error": "items must be an array"}), 400
+        if len(items) > 120:
+            return jsonify({"error": "Too many items (max 120 rule rows per request)"}), 400
+        if from_filter and not re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", from_filter):
+            return jsonify({"error": "from_filter must be a valid email address if provided"}), 400
+
+        results = []
+        lookups = 0
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            rule_name = (item.get("rule_name") or "").strip()
+            row_id = (item.get("row_id") or "").strip() or None
+            months_in = item.get("months") or []
+            if not rule_name or len(rule_name) > 500:
+                continue
+            if not isinstance(months_in, list) or not months_in:
+                continue
+
+            distinctive = distinctive_rule_text(rule_name)
+            fragment = gmail_keyword_fragment(distinctive)
+            display_token = rule_search_token(rule_name)
+            by_month: dict = {}
+
+            for m in months_in:
+                if not isinstance(m, dict):
+                    continue
+                label = (m.get("label") or "").strip()
+                after_date = (m.get("after_date") or "").strip()
+                before_date = (m.get("before_date") or "").strip()
+                if not label or not after_date or not before_date:
+                    continue
+                try:
+                    datetime.strptime(after_date, "%Y-%m-%d")
+                    datetime.strptime(before_date, "%Y-%m-%d")
+                except ValueError:
+                    by_month[label] = {
+                        "latest_incident_id": None,
+                        "latest_case_id": None,
+                        "mapped_id": None,
+                        "email_date_iso": None,
+                        "subject": None,
+                        "messages_scanned": 0,
+                        "error": "Invalid month date range",
+                    }
+                    continue
+
+                if lookups > 0:
+                    time.sleep(0.12)
+                lookups += 1
+
+                q = _gmail_rule_hits_query(fragment, after_date, before_date, from_filter)
+                if not q or not fragment:
+                    by_month[label] = {
+                        "latest_incident_id": None,
+                        "latest_case_id": None,
+                        "mapped_id": None,
+                        "email_date_iso": None,
+                        "subject": None,
+                        "messages_scanned": 0,
+                        "error": "Could not derive searchable keywords from rule name.",
+                    }
+                    continue
+                try:
+                    info = search_latest_incident_for_rule(
+                        q,
+                        distinctive_text=distinctive,
+                    )
+                    by_month[label] = {
+                        "latest_incident_id": info.get("latest_incident_id"),
+                        "latest_case_id": info.get("latest_case_id"),
+                        "mapped_id": info.get("mapped_id"),
+                        "email_date_iso": info.get("email_date_iso"),
+                        "subject": info.get("subject"),
+                        "messages_scanned": info.get("messages_scanned", 0),
+                        "gmail_query": q,
+                        "search_token": display_token,
+                    }
+                except Exception as ex:
+                    by_month[label] = {
+                        "latest_incident_id": None,
+                        "latest_case_id": None,
+                        "mapped_id": None,
+                        "email_date_iso": None,
+                        "subject": None,
+                        "messages_scanned": 0,
+                        "error": str(ex),
+                    }
+
+            results.append({
+                "rule_name": rule_name,
+                "row_id": row_id,
+                "by_month": by_month,
+            })
+
+        return jsonify({
+            "from_filter": from_filter or None,
+            "results": results,
+            "lookups_performed": lookups,
+        })
+    except Exception as e:
+        err_msg = str(e)
+        if "invalid_grant" in err_msg.lower():
+            remove_token()
+            return jsonify({
+                "error": "Gmail sign-in expired or was revoked. Please reconnect Gmail from the Alerts page (click Connect Gmail)."
+            }), 401
+        print("gmail/siem-rule-latest-incidents error:", e, flush=True)
         return jsonify({"error": err_msg}), 500
 
 
@@ -1110,6 +1436,115 @@ def _best_email_date_iso(matched_email, sorted_emails):
     return None
 
 
+def _gmail_msg_time_ms(m):
+    tid = m.get("internalDate")
+    if tid is not None and str(tid).strip() != "":
+        try:
+            return int(float(str(tid)))
+        except (ValueError, TypeError):
+            pass
+    date_hdr = (m.get("date") or "").strip()
+    if date_hdr:
+        iso = _parse_date_header_to_utc_iso(date_hdr)
+        if iso:
+            try:
+                iso2 = iso.replace("Z", "+00:00")
+                dt = datetime.fromisoformat(iso2)
+                return int(dt.timestamp() * 1000)
+            except (ValueError, TypeError, OSError):
+                pass
+    return 0
+
+
+def _gmail_latest_status_payload(search_text: str, *, newer_days: int = 30, from_addr: str = "") -> dict:
+    """
+    Resolve closure status from Gmail for one incident/ticket token.
+    Returns the same JSON shape as GET /api/gmail/latest-status (without Flask wrapper).
+    """
+    if from_addr:
+        query = f"from:{from_addr} newer_than:{newer_days}d {search_text}"
+    else:
+        query = f"newer_than:{newer_days}d {search_text}"
+    emails = fetch_recent_alerts_for_status(query=query)
+    if not emails:
+        return {
+            "suggestedStatus": None,
+            "suggestedClosureComment": None,
+            "notFound": True,
+        }
+
+    sorted_emails = sorted(emails, key=_gmail_msg_time_ms, reverse=True)
+    suggested, found_phrase, matched_email, combined_body = None, None, None, ""
+    for em in sorted_emails:
+        body = _email_body_normalized_plain(em)
+        sug, phrase = _email_suggests_closed(body)
+        if sug and phrase:
+            suggested, found_phrase, matched_email, combined_body = sug, phrase, em, body
+            break
+    if not matched_email:
+        matched_email = sorted_emails[0]
+        combined_body = _email_body_normalized_plain(matched_email)
+    try:
+        suggested_closure = _suggest_closure_comment(combined_body, matched_email, found_phrase)
+    except Exception:
+        suggested_closure = None
+    if suggested == "Closed" and not (suggested_closure or "").strip():
+        from_val = (matched_email or {}).get("from") or ""
+        cb = combined_body.replace("\xa0", " ")
+        pl = (found_phrase or "").lower()
+        phrase_idx = cb.lower().find(pl) if pl else -1
+        phrase_idx = phrase_idx if phrase_idx >= 0 else 0
+        ex = _excerpt_around_closure_phrase(cb, found_phrase or "")
+        scav = _extract_best_external_display_after_phrase(cb, phrase_idx) or _extract_best_external_display_from_body(cb)
+        if _from_header_internal(from_val):
+            suggested_closure = scav or ex or "Closed from email"
+        else:
+            suggested_closure = (
+                scav
+                or (_sender_to_closure_comment(from_val) or from_val.strip() or None)
+                or ex
+                or "Closed from email"
+            )
+    merged_all_bodies = _merged_bodies_from_emails(sorted_emails)
+    if merged_all_bodies and _body_has_nttin_portal_closure(merged_all_bodies):
+        ml = merged_all_bodies.lower()
+        if (suggested_closure or "").strip() != "Incident Auto Closed" and not any(
+            p in ml for p in _GMAIL_AUTO_CLOSED_PHRASES
+        ):
+            suggested_closure = "Vedantsingh 1"
+    if not suggested and (suggested_closure or "").strip():
+        suggested = (
+            "Incident Auto Closed"
+            if (suggested_closure or "").strip() == "Incident Auto Closed"
+            else "Closed"
+        )
+    matched_iso = _best_email_date_iso(matched_email, sorted_emails)
+    if not matched_iso and matched_email:
+        matched_iso = _parse_date_header_to_utc_iso((matched_email.get("date") or "").strip())
+    if not matched_iso and matched_email:
+        matched_iso = _email_internal_date_iso(matched_email)
+
+    snippet = combined_body
+    if len(snippet) > 300:
+        snippet = snippet[:300] + "…"
+    return {
+        "suggestedStatus": suggested,
+        "suggestedClosureComment": suggested_closure,
+        "matchedEmailDateIso": matched_iso,
+        "emailId": matched_email.get("id") if matched_email else None,
+        "snippet": snippet,
+        "foundPhrase": found_phrase,
+        "emailsChecked": len(sorted_emails),
+    }
+
+
+app.config["GMAIL_CLOSURE_RESOLVER"] = _gmail_latest_status_payload
+
+
+GMAIL_LATEST_STATUS_BATCH_MAX = 20
+GMAIL_LATEST_STATUS_BATCH_ITEM_DELAY_S = 0.35
+
+
 @app.route("/api/gmail/latest-status")
 def api_gmail_latest_status():
     """
@@ -1124,105 +1559,11 @@ def api_gmail_latest_status():
     try:
         search_text = request.args.get("q", "").strip()
         from_addr = request.args.get("from", "").strip()
-        # Weekly / FY CSV rows can reference incidents from many months ago; allow long lookback (Gmail supports newer_than:Xd).
         newer_days = max(1, min(int(request.args.get("newer_than_days", 30)), 450))
         if not search_text:
             return jsonify({"error": "Query param 'q' (search text) is required"}), 400
-        if from_addr:
-            query = f"from:{from_addr} newer_than:{newer_days}d {search_text}"
-        else:
-            query = f"newer_than:{newer_days}d {search_text}"
-        emails = fetch_recent_alerts(query=query, max_results=30, include_csv_attachments=False)
-        if not emails:
-            return jsonify({
-                "suggestedStatus": None,
-                "suggestedClosureComment": None,
-                "error": "No matching email found",
-            }), 200
-        def _msg_time_ms(m):
-            tid = m.get("internalDate")
-            if tid is not None and str(tid).strip() != "":
-                try:
-                    return int(float(str(tid)))
-                except (ValueError, TypeError):
-                    pass
-            date_hdr = (m.get("date") or "").strip()
-            if date_hdr:
-                iso = _parse_date_header_to_utc_iso(date_hdr)
-                if iso:
-                    try:
-                        iso2 = iso.replace("Z", "+00:00")
-                        dt = datetime.fromisoformat(iso2)
-                        return int(dt.timestamp() * 1000)
-                    except (ValueError, TypeError, OSError):
-                        pass
-            return 0
-
-        sorted_emails = sorted(emails, key=_msg_time_ms, reverse=True)  # newest first
-        suggested, found_phrase, matched_email, combined_body = None, None, None, ""
-        for em in sorted_emails:
-            body = _email_body_normalized_plain(em)
-            sug, phrase = _email_suggests_closed(body)
-            if sug and phrase:
-                suggested, found_phrase, matched_email, combined_body = sug, phrase, em, body
-                break
-        if not matched_email:
-            matched_email = sorted_emails[0]
-            combined_body = _email_body_normalized_plain(matched_email)
-        try:
-            suggested_closure = _suggest_closure_comment(combined_body, matched_email, found_phrase)
-        except Exception:
-            suggested_closure = None
-        if suggested == "Closed" and not (suggested_closure or "").strip():
-            from_val = (matched_email or {}).get("from") or ""
-            cb = combined_body.replace("\xa0", " ")
-            pl = (found_phrase or "").lower()
-            phrase_idx = cb.lower().find(pl) if pl else -1
-            phrase_idx = phrase_idx if phrase_idx >= 0 else 0
-            ex = _excerpt_around_closure_phrase(cb, found_phrase or "")
-            scav = _extract_best_external_display_after_phrase(cb, phrase_idx) or _extract_best_external_display_from_body(cb)
-            if _from_header_internal(from_val):
-                suggested_closure = scav or ex or "Closed from email"
-            else:
-                suggested_closure = (
-                    scav
-                    or (_sender_to_closure_comment(from_val) or from_val.strip() or None)
-                    or ex
-                    or "Closed from email"
-                )
-        # Portal line may appear in a different Gmail hit than the one that matched the generic closure phrase;
-        # scan all returned messages so Cyware "My NTTIN Portal" / CMP "MYNTTI Portal" wins over excerpts or integration names.
-        merged_all_bodies = _merged_bodies_from_emails(sorted_emails)
-        if merged_all_bodies and _body_has_nttin_portal_closure(merged_all_bodies):
-            ml = merged_all_bodies.lower()
-            if (suggested_closure or "").strip() != "Incident Auto Closed" and not any(
-                p in ml for p in _GMAIL_AUTO_CLOSED_PHRASES
-            ):
-                suggested_closure = "Vedantsingh 1"
-        # If _suggest_closure_comment found text (e.g. auto-closed) but the scan loop missed it, still return a status
-        # so the UI persists Closure_Comments (strict null suggestedStatus would skip the row).
-        if not suggested and (suggested_closure or "").strip():
-            suggested = (
-                "Incident Auto Closed"
-                if (suggested_closure or "").strip() == "Incident Auto Closed"
-                else "Closed"
-            )
-        matched_iso = _best_email_date_iso(matched_email, sorted_emails)
-        # If every message lacked internalDate but Date was ISO, _best_email_iso may still be None — try once more on matched email only
-        if not matched_iso and matched_email:
-            matched_iso = _parse_date_header_to_utc_iso((matched_email.get("date") or "").strip())
-        if not matched_iso and matched_email:
-            matched_iso = _email_internal_date_iso(matched_email)
-
-        return jsonify({
-            "suggestedStatus": suggested,
-            "suggestedClosureComment": suggested_closure,
-            "matchedEmailDateIso": matched_iso,
-            "emailId": matched_email.get("id") if matched_email else None,
-            "snippet": (combined_body[:300] + "…") if len(combined_body) > 300 else combined_body,
-            "foundPhrase": found_phrase,
-            "emailsChecked": len(sorted_emails),
-        })
+        payload = _gmail_latest_status_payload(search_text, newer_days=newer_days, from_addr=from_addr)
+        return jsonify(payload), 200
     except Exception as e:
         err_msg = str(e)
         if "invalid_grant" in err_msg.lower():
@@ -1232,6 +1573,74 @@ def api_gmail_latest_status():
             }), 401
         print("gmail/latest-status error:", e, flush=True)
         return jsonify({"error": err_msg, "suggestedStatus": None, "suggestedClosureComment": None}), 500
+
+
+@app.route("/api/gmail/latest-status-batch", methods=["POST"])
+def api_gmail_latest_status_batch():
+    """
+    POST /api/gmail/latest-status-batch
+    Body: { newer_than_days?: int, items: [{ id: str, queries: string[] }] }
+    Processes up to 20 rows per request server-side (one Flask connection) for Fetch-all runs.
+    """
+    if not GMAIL_AVAILABLE:
+        return jsonify({"error": "Gmail not configured"}), 503
+    if not is_gmail_connected():
+        return jsonify({"error": "Not connected. Connect Gmail first via /api/auth/google"}), 401
+    body = request.get_json(silent=True) or {}
+    newer_days = max(1, min(int(body.get("newer_than_days", 30)), 450))
+    items = body.get("items")
+    if not isinstance(items, list) or not items:
+        return jsonify({"error": "items must be a non-empty array"}), 400
+    if len(items) > GMAIL_LATEST_STATUS_BATCH_MAX:
+        return jsonify({"error": f"At most {GMAIL_LATEST_STATUS_BATCH_MAX} items per batch"}), 400
+
+    results = []
+    try:
+        for idx, item in enumerate(items):
+            if not isinstance(item, dict):
+                results.append({"id": str(idx), "suggestedStatus": None, "error": "invalid item"})
+                continue
+            item_id = str(item.get("id", idx))
+            raw_queries = item.get("queries") or item.get("q") or []
+            if isinstance(raw_queries, str):
+                raw_queries = [raw_queries]
+            queries: list[str] = []
+            seen: set[str] = set()
+            for q in raw_queries:
+                t = str(q).strip()
+                if t and t not in seen:
+                    seen.add(t)
+                    queries.append(t)
+
+            row_payload: dict = {"id": item_id, "suggestedStatus": None, "suggestedClosureComment": None}
+            last_error: str | None = None
+            had_successful_lookup = False
+            for q in queries:
+                try:
+                    payload = _gmail_latest_status_payload(q, newer_days=newer_days)
+                    had_successful_lookup = True
+                    row_payload.update(payload)
+                    if payload.get("notFound"):
+                        row_payload["notFound"] = True
+                    if payload.get("suggestedStatus"):
+                        break
+                except Exception as e:
+                    last_error = str(e)
+                    if "invalid_grant" in last_error.lower():
+                        remove_token()
+                        return jsonify({
+                            "error": "Gmail sign-in expired or was revoked. Please reconnect Gmail from the Alerts page (click Connect Gmail)."
+                        }), 401
+            if not had_successful_lookup and last_error:
+                row_payload["error"] = last_error
+            results.append(row_payload)
+            if idx < len(items) - 1:
+                time.sleep(GMAIL_LATEST_STATUS_BATCH_ITEM_DELAY_S)
+        return jsonify({"results": results}), 200
+    except Exception as e:
+        err_msg = str(e)
+        print("gmail/latest-status-batch error:", e, flush=True)
+        return jsonify({"error": err_msg, "results": results}), 500
 
 
 # ---------------------------------------------------------------------
@@ -1378,8 +1787,52 @@ def api_jira_search_issues():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/jira/issues/match-tokens", methods=["POST"])
+@_require_auth
+def api_jira_match_tokens():
+    """Legacy alias — prefer POST /api/jira-tickets/match-tokens."""
+    try:
+        from jira_client import search_issues_by_summary_tokens
+    except ImportError:
+        return jsonify({"error": "Jira client not available"}), 503
+    body = request.get_json(silent=True) or {}
+    tokens = body.get("tokens") or []
+    if not isinstance(tokens, list):
+        return jsonify({"error": "tokens must be an array"}), 400
+    try:
+        max_per = min(int(body.get("max_per_token", 5)), 20)
+    except (TypeError, ValueError):
+        max_per = 5
+    cleaned = [t for t in tokens if isinstance(t, str) and t.strip()]
+    if len(cleaned) > 500:
+        return jsonify({"error": "Too many tokens (max 500)"}), 400
+    try:
+        matches = search_issues_by_summary_tokens(cleaned, max_per_token=max_per)
+        return jsonify({"matches": matches})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except RuntimeError as e:
+        print("Jira match_tokens failed:", e, flush=True)
+        return jsonify({"error": str(e)}), 502
+    except Exception as e:
+        print("Jira match_tokens error:", e, flush=True)
+        return jsonify({"error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------
+# HEALTH (no auth — used by frontend to detect Flask restart during fetch-all)
+# ---------------------------------------------------------------------
+@app.route("/api/health")
+def api_health():
+    return jsonify({"ok": True})
+
+
 # ---------------------------------------------------------------------
 # START BACKEND
 # ---------------------------------------------------------------------
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    # On Windows, the watchdog reloader can mistakenly pick up changes in Python
+    # stdlib/site-packages and reset in-flight requests (seen as ERR_CONNECTION_RESET).
+    # Keep debug mode for tracebacks, but disable the auto-reloader.
+    # threaded=True: long Gmail latest-status calls must not block other requests.
+    app.run(host="0.0.0.0", port=5000, debug=True, use_reloader=False, use_debugger=False, threaded=True)

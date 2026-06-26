@@ -20,5 +20,9 @@ export interface GmailMessage {
   body: string;
   bodyHtml?: string;
   internalDate?: string;
+  /** Dashboard calendar day (YYYY-MM-DD) when set — e.g. late delivery. */
+  reportDate?: string | null;
+  /** Gmail received day (YYYY-MM-DD), when provided by the API. */
+  receivedDate?: string | null;
   csvAttachment?: CsvAttachment;
 }

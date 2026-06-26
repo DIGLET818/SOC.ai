@@ -20,7 +20,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   DailyAlertsAuthError,
   getDailyAlerts,
-  syncDailyAlerts,
+  syncDailyAlertsResilient,
   type DailyOverrideRecord,
   type JiraCreatedRecord,
 } from "@/api/dailyAlerts";
@@ -126,7 +126,7 @@ export function useDailyAlertsData({
       setSyncing(true);
       setError(null);
       try {
-        await syncDailyAlerts({ afterDate, beforeDate, maxResults });
+        await syncDailyAlertsResilient({ afterDate, beforeDate, maxResults });
         await loadFromDb(afterDate, beforeDate);
       } catch (err) {
         if (err instanceof DailyAlertsAuthError) {
@@ -147,7 +147,7 @@ export function useDailyAlertsData({
         setSyncing(true);
         setError(null);
         try {
-          await syncDailyAlerts({
+          await syncDailyAlertsResilient({
             afterDate: rangeAfter,
             beforeDate: rangeBefore,
             maxResults,

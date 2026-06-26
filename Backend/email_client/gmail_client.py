@@ -4,6 +4,9 @@ import csv
 import io
 import os
 import re
+import threading
+import time
+from datetime import datetime, timezone
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
@@ -13,11 +16,89 @@ SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOKEN_PATH = os.path.join(BACKEND_DIR, "token.json")
 
+_GMAIL_SERVICE = None
+_GMAIL_LOCK = threading.Lock()
+
+
+def _reset_gmail_service() -> None:
+    global _GMAIL_SERVICE
+    _GMAIL_SERVICE = None
+
 
 def _get_service():
+    global _GMAIL_SERVICE
+    if _GMAIL_SERVICE is not None:
+        return _GMAIL_SERVICE
     creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
-    service = build("gmail", "v1", credentials=creds)
-    return service
+    _GMAIL_SERVICE = build("gmail", "v1", credentials=creds, cache_discovery=False)
+    return _GMAIL_SERVICE
+
+
+def _is_transient_gmail_error(exc: BaseException) -> bool:
+    if isinstance(exc, (ConnectionResetError, BrokenPipeError, TimeoutError)):
+        return True
+    if isinstance(exc, OSError):
+        winerr = getattr(exc, "winerror", None)
+        if winerr in (10053, 10054, 10060, 10061):
+            return True
+        if exc.errno in (104, 110, 111):
+            return True
+    msg = str(exc).lower()
+    if any(
+        token in msg
+        for token in (
+            "connection aborted",
+            "connection reset",
+            "broken pipe",
+            "temporarily unavailable",
+            "service unavailable",
+            "rate limit",
+            "quota exceeded",
+            "winerror 10053",
+            "winerror 10054",
+            "[10053]",
+            "[10054]",
+        )
+    ):
+        return True
+    try:
+        from googleapiclient.errors import HttpError
+
+        if isinstance(exc, HttpError):
+            status = getattr(getattr(exc, "resp", None), "status", None)
+            if status in (429, 500, 502, 503, 504):
+                return True
+    except ImportError:
+        pass
+    return False
+
+
+def _gmail_execute(request, retries: int = 5):
+    """Run one Gmail API request; serialize access and retry transient socket errors."""
+    last_exc: BaseException | None = None
+    for attempt in range(retries):
+        try:
+            with _GMAIL_LOCK:
+                return request.execute()
+        except Exception as exc:
+            last_exc = exc
+            if not _is_transient_gmail_error(exc) or attempt >= retries - 1:
+                raise
+            _reset_gmail_service()
+            delay = 0.6 * (2**attempt)
+            print(
+                f"gmail execute retry {attempt + 1}/{retries - 1}: {exc}",
+                flush=True,
+            )
+            time.sleep(delay)
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("gmail execute failed without exception")
+
+
+def is_transient_gmail_error(exc: BaseException) -> bool:
+    """Public helper for route-level retries."""
+    return _is_transient_gmail_error(exc)
 
 def _decode_body(data):
     if not data:
@@ -45,11 +126,13 @@ def _extract_from_parts(parts, body_plain, body_html):
 
 def _get_attachment(service, user_id, message_id, attachment_id):
     """Fetch attachment bytes by id."""
-    att = service.users().messages().attachments().get(
-        userId=user_id,
-        messageId=message_id,
-        id=attachment_id,
-    ).execute()
+    att = _gmail_execute(
+        service.users().messages().attachments().get(
+            userId=user_id,
+            messageId=message_id,
+            id=attachment_id,
+        )
+    )
     data = att.get("data")
     if not data:
         return None
@@ -128,25 +211,18 @@ def _find_csv_in_parts(service, user_id, message_id, parts):
     return None
 
 
-def fetch_recent_alerts(query="subject:Case OR subject:Offense", max_results=50, include_csv_attachments=False):
-    """
-    Returns list of emails with keys: id, subject, date, from, body, bodyHtml, internalDate.
-    Extracts both text/plain and text/html so HTML emails (e.g. NTT) show content.
-    Paginates Gmail messages.list (max 500 per page) until max_results or no nextPageToken.
-    """
+def _list_message_ids(service, query: str, max_results: int) -> list[str]:
+    """Gmail messages.list — returns up to max_results unique message ids (newest first per Gmail)."""
     max_results = max(1, min(int(max_results), 2500))
-    print("fetch_recent_alerts: start", query, max_results, flush=True)
-    service = _get_service()
-
-    seen_ids = set()
-    message_ids = []
+    seen_ids: set[str] = set()
+    message_ids: list[str] = []
     page_token = None
     while len(message_ids) < max_results:
         page_size = min(500, max_results - len(message_ids))
         kwargs = {"userId": "me", "q": query, "maxResults": page_size}
         if page_token:
             kwargs["pageToken"] = page_token
-        resp = service.users().messages().list(**kwargs).execute()
+        resp = _gmail_execute(service.users().messages().list(**kwargs))
         batch = resp.get("messages") or []
         for msg in batch:
             mid = msg.get("id")
@@ -158,73 +234,127 @@ def fetch_recent_alerts(query="subject:Case OR subject:Offense", max_results=50,
         page_token = resp.get("nextPageToken")
         if not page_token or not batch:
             break
+    return message_ids
 
-    results = []
 
-    for msg_id in message_ids:
-        m = service.users().messages().get(
-            userId="me",
-            id=msg_id,
-            format="full",
-        ).execute()
+def _fetch_message_item(service, msg_id: str, include_csv_attachments: bool = False) -> dict:
+    """Fetch one Gmail message and normalize to the fetch_recent_alerts item shape."""
+    m = _gmail_execute(
+        service.users().messages().get(userId="me", id=msg_id, format="full")
+    )
 
-        payload = m.get("payload", {})
-        headers = payload.get("headers", [])
+    payload = m.get("payload", {})
+    headers = payload.get("headers", [])
 
-        subject = next((h["value"] for h in headers if h["name"].lower() == "subject"), "")
-        date = next((h["value"] for h in headers if h["name"].lower() == "date"), "")
-        sender = next((h["value"] for h in headers if h["name"].lower() == "from"), "")
+    subject = next((h["value"] for h in headers if h["name"].lower() == "subject"), "")
+    date = next((h["value"] for h in headers if h["name"].lower() == "date"), "")
+    sender = next((h["value"] for h in headers if h["name"].lower() == "from"), "")
 
-        body = ""
-        body_html = ""
-        parts = payload.get("parts")
-        if parts:
-            body, body_html = _extract_from_parts(parts, body, body_html)
-            # If no plain text but we have HTML, use HTML as fallback for body (snippet)
-            if not body and body_html:
+    body = ""
+    body_html = ""
+    parts = payload.get("parts")
+    if parts:
+        body, body_html = _extract_from_parts(parts, body, body_html)
+        if not body and body_html:
+            body = re.sub(r"<[^>]+>", " ", body_html).strip()
+            body = (body[:500] + "…") if len(body) > 500 else body
+    else:
+        b = payload.get("body", {}).get("data")
+        if b:
+            decoded = _decode_body(b)
+            mt = (payload.get("mimeType") or "").lower()
+            if mt == "text/html":
+                body_html = decoded
                 body = re.sub(r"<[^>]+>", " ", body_html).strip()
                 body = (body[:500] + "…") if len(body) > 500 else body
-        else:
-            b = payload.get("body", {}).get("data")
-            if b:
-                decoded = _decode_body(b)
+            else:
+                body = decoded
+
+    item = {
+        "id": m.get("id"),
+        "subject": subject,
+        "date": date,
+        "from": sender,
+        "body": body,
+        "bodyHtml": body_html,
+        "internalDate": m.get("internalDate"),
+    }
+    if include_csv_attachments:
+        csv_att = None
+        if parts:
+            csv_att = _find_csv_in_parts(service, "me", m["id"], parts)
+        if not csv_att and not parts:
+            payload_body = payload.get("body", {})
+            att_id = payload_body.get("attachmentId")
+            if att_id:
                 mt = (payload.get("mimeType") or "").lower()
-                if mt == "text/html":
-                    body_html = decoded
-                    body = re.sub(r"<[^>]+>", " ", body_html).strip()
-                    body = (body[:500] + "…") if len(body) > 500 else body
-                else:
-                    body = decoded
+                filename = payload.get("filename") or _get_part_filename(payload) or "attachment.csv"
+                if filename.lower().endswith(".csv") or mt in ("text/csv", "application/csv"):
+                    raw = _get_attachment(service, "me", m["id"], att_id)
+                    if raw:
+                        csv_att = _parse_csv_raw(raw, filename)
+        if csv_att:
+            item["csvAttachment"] = csv_att
+    return item
 
-        item = {
-            "id": m.get("id"),
-            "subject": subject,
-            "date": date,
-            "from": sender,
-            "body": body,
-            "bodyHtml": body_html,
-            "internalDate": m.get("internalDate"),
-        }
-        if include_csv_attachments:
-            csv_att = None
-            if parts:
-                csv_att = _find_csv_in_parts(service, "me", m["id"], parts)
-            if not csv_att and not parts:
-                # Single-part message: whole body might be CSV attachment
-                payload_body = payload.get("body", {})
-                att_id = payload_body.get("attachmentId")
-                if att_id:
-                    mt = (payload.get("mimeType") or "").lower()
-                    filename = payload.get("filename") or _get_part_filename(payload) or "attachment.csv"
-                    if filename.lower().endswith(".csv") or mt in ("text/csv", "application/csv"):
-                        raw = _get_attachment(service, "me", m["id"], att_id)
-                        if raw:
-                            csv_att = _parse_csv_raw(raw, filename)
-            if csv_att:
-                item["csvAttachment"] = csv_att
-        results.append(item)
 
+GMAIL_MESSAGE_FETCH_DELAY_S = 0.12
+
+
+def _fetch_message_item_resilient(
+    service, msg_id: str, include_csv_attachments: bool = False
+) -> dict:
+    """Fetch one message; retry the whole message on transient socket errors."""
+    last_exc: BaseException | None = None
+    for attempt in range(4):
+        try:
+            return _fetch_message_item(service, msg_id, include_csv_attachments)
+        except Exception as exc:
+            last_exc = exc
+            if not _is_transient_gmail_error(exc) or attempt >= 3:
+                raise
+            _reset_gmail_service()
+            time.sleep(0.5 * (2**attempt))
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("message fetch failed without exception")
+
+
+def fetch_recent_alerts(query="subject:Case OR subject:Offense", max_results=50, include_csv_attachments=False):
+    """
+    Returns list of emails with keys: id, subject, date, from, body, bodyHtml, internalDate.
+    Extracts both text/plain and text/html so HTML emails (e.g. NTT) show content.
+    Paginates Gmail messages.list (max 500 per page) until max_results or no nextPageToken.
+    """
+    max_results = max(1, min(int(max_results), 2500))
+    print("fetch_recent_alerts: start", query, max_results, flush=True)
+    service = _get_service()
+    message_ids = _list_message_ids(service, query, max_results)
+    results = []
+    for i, msg_id in enumerate(message_ids):
+        results.append(_fetch_message_item_resilient(service, msg_id, include_csv_attachments))
+        if i < len(message_ids) - 1:
+            time.sleep(GMAIL_MESSAGE_FETCH_DELAY_S)
     print("fetch_recent_alerts: end, emails:", len(results), flush=True)
+    return results
+
+
+# Lighter cap for /api/gmail/latest-status — each hit fetches full bodies; 30× per row overloads Flask.
+GMAIL_LATEST_STATUS_MAX_MESSAGES = 10
+
+
+def fetch_recent_alerts_for_status(query: str, max_results: int = GMAIL_LATEST_STATUS_MAX_MESSAGES) -> list:
+    """Same shape as fetch_recent_alerts but capped for closure-status scans."""
+    cap = max(1, min(int(max_results), GMAIL_LATEST_STATUS_MAX_MESSAGES))
+    print("fetch_recent_alerts_for_status: start", query, cap, flush=True)
+    service = _get_service()
+    message_ids = _list_message_ids(service, query, cap)
+    results = []
+    for i, msg_id in enumerate(message_ids):
+        results.append(_fetch_message_item_resilient(service, msg_id, False))
+        if i < len(message_ids) - 1:
+            time.sleep(GMAIL_MESSAGE_FETCH_DELAY_S)
+    print("fetch_recent_alerts_for_status: end, emails:", len(results), flush=True)
     return results
 
 
@@ -342,23 +472,27 @@ def search_messages_light(
     sample_n = max(0, min(int(sample_n), 20))
     max_metadata_scan = max(10, min(int(max_metadata_scan), 500))
 
-    resp = service.users().messages().list(
-        userId="me",
-        q=query,
-        maxResults=max_results,
-    ).execute()
+    resp = _gmail_execute(
+        service.users().messages().list(
+            userId="me",
+            q=query,
+            maxResults=max_results,
+        )
+    )
 
     messages = resp.get("messages", []) or []
     next_token = resp.get("nextPageToken")
     capped_list = bool(next_token)
 
     def fetch_subject(mid: str) -> str:
-        m = service.users().messages().get(
-            userId="me",
-            id=mid,
-            format="metadata",
-            metadataHeaders=["Subject"],
-        ).execute()
+        m = _gmail_execute(
+            service.users().messages().get(
+                userId="me",
+                id=mid,
+                format="metadata",
+                metadataHeaders=["Subject"],
+            )
+        )
         headers = (m.get("payload") or {}).get("headers", [])
         return next((h["value"] for h in headers if (h.get("name") or "").lower() == "subject"), "")
 
@@ -398,6 +532,189 @@ def search_messages_light(
         "capped_at_max": capped,
         "sample_subjects": sample_subjects,
         "sample_ids": sample_ids,
+    }
+
+
+_INCIDENT_ID_RE = re.compile(r"\b(INC\d+)\b", re.IGNORECASE)
+_CASE_ID_RE = re.compile(r"\bCase:\s*(CS\d+)\b", re.IGNORECASE)
+_CS_FALLBACK_RE = re.compile(r"\b(CS\d{5,})\b", re.IGNORECASE)
+
+
+def extract_incident_id_from_text(text: str) -> str | None:
+    """First ServiceNow-style INC###### in text (uppercased)."""
+    m = _INCIDENT_ID_RE.search(text or "")
+    return m.group(1).upper() if m else None
+
+
+def extract_case_id_from_text(text: str) -> str | None:
+    """Case / CS id (e.g. Case: CS14757515 or standalone CS########)."""
+    raw = text or ""
+    m = _CASE_ID_RE.search(raw)
+    if m:
+        return m.group(1).upper()
+    m = _CS_FALLBACK_RE.search(raw)
+    return m.group(1).upper() if m else None
+
+
+def extract_ids_from_text(text: str) -> tuple[str | None, str | None]:
+    """Return (INC, CS) from a single text blob."""
+    return extract_incident_id_from_text(text), extract_case_id_from_text(text)
+
+
+def merge_ids_from_texts(*texts: str) -> tuple[str | None, str | None]:
+    """Collect first INC and first CS found across subject/body fragments."""
+    inc: str | None = None
+    cs: str | None = None
+    for t in texts:
+        if not t:
+            continue
+        ti, tc = extract_ids_from_text(t)
+        if ti and not inc:
+            inc = ti
+        if tc and not cs:
+            cs = tc
+        if inc and cs:
+            break
+    return inc, cs
+
+
+def mapped_month_id(inc: str | None, cs: str | None) -> str | None:
+    """Value for SIEM month column: INC when present, else CS."""
+    return inc or cs
+
+
+def _fetch_message_body_plain(service, message_id: str, max_chars: int = 12000) -> str:
+    """Plain-ish text from message body (for INC in ServiceNow digest when subject only has CS)."""
+    m = _gmail_execute(
+        service.users().messages().get(
+            userId="me",
+            id=message_id,
+            format="full",
+        )
+    )
+    payload = m.get("payload", {})
+    body = ""
+    body_html = ""
+    parts = payload.get("parts")
+    if parts:
+        body, body_html = _extract_from_parts(parts, body, body_html)
+        if not body and body_html:
+            body = re.sub(r"<[^>]+>", " ", body_html).strip()
+    else:
+        b = payload.get("body", {}).get("data")
+        if b:
+            decoded = _decode_body(b)
+            mt = (payload.get("mimeType") or "").lower()
+            if mt == "text/html":
+                body = re.sub(r"<[^>]+>", " ", decoded).strip()
+            else:
+                body = decoded
+    if len(body) > max_chars:
+        body = body[:max_chars]
+    return body
+
+
+def _internal_ms_to_iso(internal_ms) -> str | None:
+    if internal_ms is None:
+        return None
+    try:
+        ms = int(float(str(internal_ms)))
+    except (ValueError, TypeError):
+        return None
+    if ms <= 0:
+        return None
+    return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def search_latest_incident_for_rule(
+    query: str,
+    distinctive_text: str,
+    max_results: int = 80,
+    max_metadata_scan: int = 60,
+) -> dict:
+    """
+    Search Gmail for messages matching `query`, filter by rule title.
+    Returns newest mapped id: INC###### when present in subject/body, else CS########.
+    """
+    service = _get_service()
+    max_results = max(1, min(int(max_results), 500))
+    max_metadata_scan = max(10, min(int(max_metadata_scan), 500))
+    dist = (distinctive_text or "").strip()
+
+    resp = _gmail_execute(
+        service.users().messages().list(
+            userId="me",
+            q=query,
+            maxResults=max_results,
+        )
+    )
+    messages = resp.get("messages", []) or []
+
+    best_ms = -1
+    best_inc: str | None = None
+    best_cs: str | None = None
+    best_mapped: str | None = None
+    best_subj: str | None = None
+    best_date_iso: str | None = None
+    scanned = 0
+    bodies_fetched = 0
+    max_body_fetches = 8
+
+    def fetch_subject_and_date(mid: str) -> tuple[str, int]:
+        m = _gmail_execute(
+            service.users().messages().get(
+                userId="me",
+                id=mid,
+                format="metadata",
+                metadataHeaders=["Subject"],
+            )
+        )
+        headers = (m.get("payload") or {}).get("headers", [])
+        subj = next((h["value"] for h in headers if (h.get("name") or "").lower() == "subject"), "")
+        internal = m.get("internalDate")
+        try:
+            ms = int(float(str(internal))) if internal is not None else 0
+        except (ValueError, TypeError):
+            ms = 0
+        return subj, ms
+
+    for msg in messages[:max_metadata_scan]:
+        mid = msg.get("id")
+        if not mid:
+            continue
+        scanned += 1
+        try:
+            subj, ms = fetch_subject_and_date(mid)
+        except Exception:
+            continue
+        if dist and not subject_matches_distinctive(subj, dist):
+            continue
+        inc, cs = merge_ids_from_texts(subj)
+        if not inc and bodies_fetched < max_body_fetches:
+            try:
+                body = _fetch_message_body_plain(service, mid)
+                bodies_fetched += 1
+                inc, cs = merge_ids_from_texts(subj, body)
+            except Exception:
+                pass
+        mapped = mapped_month_id(inc, cs)
+        if not mapped:
+            continue
+        if ms >= best_ms:
+            best_ms = ms
+            best_inc = inc
+            best_cs = cs
+            best_mapped = mapped
+            best_subj = subj
+            best_date_iso = _internal_ms_to_iso(ms)
+
+    return {
+        "latest_incident_id": best_inc,
+        "latest_case_id": best_cs,
+        "mapped_id": best_mapped,
+        "email_date_iso": best_date_iso,
+        "subject": best_subj,
+        "messages_scanned": scanned,
     }
 
 

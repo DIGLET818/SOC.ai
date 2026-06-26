@@ -19,7 +19,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   getCurrentUser,
   getWeeklyReports,
-  syncWeeklyReports,
+  syncWeeklyReportsResilient,
   WeeklyReportsAuthError,
   type CurrentUser,
   type WeeklyOverrideRecord,
@@ -117,7 +117,7 @@ export function useWeeklyReportData({
       setSyncing(true);
       setError(null);
       try {
-        await syncWeeklyReports({ afterDate, beforeDate, maxResults });
+        await syncWeeklyReportsResilient({ afterDate, beforeDate, maxResults });
         await loadFromDb(afterDate, beforeDate);
       } catch (err) {
         if (err instanceof WeeklyReportsAuthError) {
@@ -138,7 +138,7 @@ export function useWeeklyReportData({
         setSyncing(true);
         setError(null);
         try {
-          await syncWeeklyReports({
+          await syncWeeklyReportsResilient({
             afterDate: rangeAfter,
             beforeDate: rangeBefore,
             maxResults,

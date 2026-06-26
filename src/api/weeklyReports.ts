@@ -6,7 +6,7 @@
  * Google account that completed OAuth (workspace rule: PII responses must
  * require strong auth).
  */
-import { API_BASE_URL } from "./client";
+import { API_BASE_URL, waitForBackend } from "./client";
 import type { CsvAttachment, GmailMessage } from "@/types/gmail";
 
 /** Override fields recognised by the server. */
@@ -156,6 +156,44 @@ export async function syncWeeklyReports(params: {
   });
 }
 
+function isRetryableWeeklyGmailError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const m = err.message.toLowerCase();
+  return (
+    m.includes("failed to fetch") ||
+    m.includes("networkerror") ||
+    m.includes("connection refused") ||
+    m.includes("connection reset") ||
+    m.includes("connection aborted") ||
+    m.includes("load failed") ||
+    m.includes("10053") ||
+    m.includes("10054") ||
+    m.includes("503") ||
+    m.includes("502") ||
+    m.includes("429") ||
+    m.includes("api error (500)")
+  );
+}
+
+/** Retry weekly Gmail sync when Windows socket / transient backend errors occur. */
+export async function syncWeeklyReportsResilient(
+  params: Parameters<typeof syncWeeklyReports>[0],
+  maxAttempts = 4
+): Promise<SyncResponse> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      if (attempt > 0) await sleep(2500 * attempt);
+      return await syncWeeklyReports(params);
+    } catch (e) {
+      lastErr = e;
+      if (!isRetryableWeeklyGmailError(e) || attempt === maxAttempts - 1) throw e;
+      await waitForBackend(25_000, 5_000);
+    }
+  }
+  throw lastErr;
+}
+
 /** Upsert a single override (status / closure_comment / closure_date). */
 export async function upsertOverride(params: {
   messageId: string;
@@ -168,6 +206,82 @@ export async function upsertOverride(params: {
     method: "PATCH",
     jsonBody: { field, value },
   });
+}
+
+/** Bulk upsert overrides in one request (Fetch-all saves; overwrites existing). */
+export async function bulkUpsertOverrides(
+  overrides: ImportOverridesItem[]
+): Promise<{ ok: true; written: number }> {
+  return call("/weekly-reports/overrides/bulk", {
+    method: "POST",
+    jsonBody: { overrides },
+  });
+}
+
+export type FetchClosureBatchItem = {
+  row_index: number;
+  queries: string[];
+};
+
+export type FetchClosureBatchResult = {
+  rowIndex: number;
+  suggestedStatus: "Closed" | "Incident Auto Closed" | null;
+  suggestedClosureComment?: string | null;
+  matchedEmailDateIso?: string | null;
+  persisted?: boolean;
+  notFound?: boolean;
+  error?: string;
+};
+
+export type FetchClosureBatchResponse = {
+  ok: true;
+  results: FetchClosureBatchResult[];
+  updated: number;
+  datesSet: number;
+};
+
+/** Gmail lookup + server-side DB persist for Fetch all (one HTTP call per chunk). */
+export async function fetchClosureBatch(params: {
+  messageId: string;
+  items: FetchClosureBatchItem[];
+  newerThanDays?: number;
+}): Promise<FetchClosureBatchResponse> {
+  const { messageId, items, newerThanDays = 400 } = params;
+  return call<FetchClosureBatchResponse>("/weekly-reports/fetch-closure-batch", {
+    method: "POST",
+    jsonBody: {
+      message_id: messageId,
+      newer_than_days: newerThanDays,
+      items,
+    },
+  });
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function isRetryableFetchError(err: unknown): boolean {
+  return isRetryableWeeklyGmailError(err);
+}
+
+/** Retry Fetch-all batch when Flask restarts or the connection drops. */
+export async function fetchClosureBatchResilient(
+  params: Parameters<typeof fetchClosureBatch>[0],
+  maxAttempts = 5
+): Promise<FetchClosureBatchResponse> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      if (attempt > 0) await sleep(3000 * attempt);
+      return await fetchClosureBatch(params);
+    } catch (e) {
+      lastErr = e;
+      if (!isRetryableFetchError(e) || attempt === maxAttempts - 1) throw e;
+      await waitForBackend(25_000, 5_000);
+    }
+  }
+  throw lastErr;
 }
 
 /** Bulk import for the one-time "Import my local edits" migration. */

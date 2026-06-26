@@ -1,10 +1,11 @@
-import { useMemo, useState, useCallback, useEffect, useLayoutEffect } from "react";
+import { useMemo, useState, useCallback, useEffect, useLayoutEffect, useRef } from "react";
 import { format } from "date-fns";
 import { SidebarProvider, SidebarInset } from "@/components/ui/sidebar";
 import { SOCSidebar } from "@/components/SOCSidebar";
 import { ThemeToggle } from "@/components/ThemeToggle";
 import { NotificationsPanel } from "@/components/NotificationsPanel";
 import { CsvDataTable } from "@/components/CsvDataTable";
+import { ReportStatusSummaryCard } from "@/components/ReportStatusSummaryCard";
 import { EmailDetailSheet } from "@/components/EmailDetailSheet";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -17,16 +18,37 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { RefreshCw, ChevronLeft, ChevronRight, Calendar as CalendarIcon, FileText, DatabaseZap } from "lucide-react";
+import {
+  RefreshCw,
+  ChevronLeft,
+  ChevronRight,
+  Calendar as CalendarIcon,
+  FileText,
+  DatabaseZap,
+  Upload,
+  Search,
+} from "lucide-react";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { API_BASE_URL } from "@/api/client";
 import { useDailyAlertsData } from "@/hooks/useDailyAlertsData";
 import {
   upsertDailyOverride,
   importDailyOverrides,
-  syncDailyAlerts,
+  syncDailyAlertsResilient,
   getDailyAlerts,
+  recoverDailyReport,
+  uploadDailyReportData,
   type DailyOverrideRecord,
+  type RecoverDailyReportCandidate,
 } from "@/api/dailyAlerts";
+import { parseReportSpreadsheetFile } from "@/lib/parseReportSpreadsheet";
 import { importJiraTickets } from "@/api/jiraTickets";
 import {
   collectLegacyMigrationCandidates,
@@ -109,8 +131,18 @@ function formatReportDate(email: GmailMessage): string {
   });
 }
 
-/** Local calendar YYYY-MM-DD for an email (for matching DayPicker selection). */
+/** Dashboard calendar day: reportDate override, else Gmail received day. */
 function emailCalendarDateKey(email: GmailMessage): string {
+  if (email.reportDate?.trim()) return email.reportDate.trim();
+  if (email.receivedDate?.trim()) return email.receivedDate.trim();
+  const ts = parseEmailDate(email);
+  const d = new Date(ts);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+function emailReceivedDateKey(email: GmailMessage): string {
+  if (email.receivedDate?.trim()) return email.receivedDate.trim();
   const ts = parseEmailDate(email);
   const d = new Date(ts);
   const pad = (n: number) => String(n).padStart(2, "0");
@@ -283,12 +315,125 @@ export default function DailyAlerts() {
     const after = fetchDate;
     const before = nextDay(fetchDate);
     refetchDateRange(after, before).then(() => {
-      toast({ title: "Date fetched", description: `Data for ${fetchDate} merged into month view.` });
+      toast({
+        title: "Gmail fetched",
+        description: `Emails received on ${fetchDate} are in the database.`,
+      });
     });
   }, [fetchDate, refetchDateRange]);
 
+  const [recoverDate, setRecoverDate] = useState<string>(() => toYYYYMMDD(new Date()));
+  const [recovering, setRecovering] = useState(false);
+  const [recoverDialogOpen, setRecoverDialogOpen] = useState(false);
+  const [recoverCandidates, setRecoverCandidates] = useState<RecoverDailyReportCandidate[]>([]);
+  const [recoverTargetDate, setRecoverTargetDate] = useState("");
+  const [uploading, setUploading] = useState(false);
+  const csvUploadRef = useRef<HTMLInputElement>(null);
+
+  const handleRecoverMissing = useCallback(async () => {
+    setRecovering(true);
+    try {
+      const resp = await recoverDailyReport({ reportDate: recoverDate, searchDays: 14 });
+      await reload();
+
+      const unassigned = resp.candidates.filter((c) => c.rowCount > 0 && c.reportDate !== recoverDate);
+      if (resp.candidates.length === 0) {
+        toast({
+          title: "No daily report found",
+          description:
+            `Gmail search found no "PB Daily report" with PB_Daily.csv between ${resp.searchAfter} and ${resp.searchBefore} ` +
+            `(includes 7 days before the missing day). If the mail is in your inbox, restart the backend and try again, or use Upload file.`,
+          variant: "destructive",
+        });
+        return;
+      }
+      if (unassigned.length === 1) {
+        await recoverDailyReport({ reportDate: recoverDate, messageId: unassigned[0]!.messageId });
+        await reload();
+        toast({
+          title: "Report recovered",
+          description: `Assigned to ${recoverDate} (received ${unassigned[0]!.receivedDate ?? "unknown"}).`,
+        });
+        return;
+      }
+      if (unassigned.length === 0) {
+        toast({
+          title: "Already on dashboard",
+          description: `A report for ${recoverDate} is already loaded.`,
+        });
+        return;
+      }
+      setRecoverTargetDate(recoverDate);
+      setRecoverCandidates(unassigned);
+      setRecoverDialogOpen(true);
+    } catch (err) {
+      toast({
+        title: "Recover failed",
+        description: err instanceof Error ? err.message : String(err),
+        variant: "destructive",
+      });
+    } finally {
+      setRecovering(false);
+    }
+  }, [recoverDate, reload]);
+
+  const handleAssignRecoverCandidate = useCallback(
+    async (messageId: string) => {
+      setRecovering(true);
+      try {
+        await recoverDailyReport({ reportDate: recoverTargetDate, messageId });
+        await reload();
+        setRecoverDialogOpen(false);
+        toast({
+          title: "Report assigned",
+          description: `This email is now shown on ${recoverTargetDate} in the calendar.`,
+        });
+      } catch (err) {
+        toast({
+          title: "Could not assign",
+          description: err instanceof Error ? err.message : String(err),
+          variant: "destructive",
+        });
+      } finally {
+        setRecovering(false);
+      }
+    },
+    [recoverTargetDate, reload]
+  );
+
+  const handleUploadReportFile = useCallback(
+    async (file: File) => {
+      setUploading(true);
+      try {
+        const parsed = await parseReportSpreadsheetFile(file);
+        const resp = await uploadDailyReportData({
+          reportDate: recoverDate,
+          filename: parsed.filename,
+          headers: parsed.headers,
+          rows: parsed.rows,
+          replace: true,
+        });
+        await reload();
+        toast({
+          title: "Report uploaded",
+          description: `${resp.rowCount} row(s) loaded for ${resp.reportDate} from ${parsed.filename}.`,
+        });
+      } catch (err) {
+        toast({
+          title: "Upload failed",
+          description: err instanceof Error ? err.message : String(err),
+          variant: "destructive",
+        });
+      } finally {
+        setUploading(false);
+      }
+    },
+    [recoverDate, reload]
+  );
+
   useEffect(() => {
     setFetchDate(fetchDateForMonth);
+    setRecoverDate(fetchDateForMonth);
   }, [selectedYear, selectedMonth, fetchDateForMonth]);
 
   const reportListSignature = useMemo(() => emailsWithCsv.map((e) => e.id).join(","), [emailsWithCsv]);
@@ -448,7 +593,7 @@ export default function DailyAlerts() {
         if (!range) continue;
         setImportStage(`Syncing ${ym} (${i + 1}/${months.length})…`);
         try {
-          await syncDailyAlerts({ afterDate: range.afterDate, beforeDate: range.beforeDate });
+          await syncDailyAlertsResilient({ afterDate: range.afterDate, beforeDate: range.beforeDate });
         } catch (err) {
           // eslint-disable-next-line no-console
           console.warn(`[DailyAlerts import] sync failed for ${ym}:`, err);
@@ -615,19 +760,55 @@ export default function DailyAlerts() {
                 <RefreshCw className={`h-4 w-4 mr-2 ${syncing ? "animate-spin" : ""}`} />
                 {syncing ? "Syncing…" : "Refresh"}
               </Button>
-              <div className="flex items-center gap-2 shrink-0 border-l border-border pl-4">
-                <span className="text-sm text-muted-foreground hidden sm:inline">Fetch date</span>
+              <div className="flex flex-wrap items-center gap-2 shrink-0 border-l border-border pl-4 max-w-[44rem]">
+                <span className="text-xs font-medium text-muted-foreground whitespace-nowrap">Missing day</span>
                 <input
                   type="date"
                   className="h-9 rounded-md border border-input bg-background px-2 text-sm w-[8.5rem]"
                   min={fetchDateMin}
                   max={fetchDateMax}
-                  value={fetchDate}
-                  onChange={(e) => setFetchDate(e.target.value)}
+                  value={recoverDate}
+                  onChange={(e) => {
+                    setRecoverDate(e.target.value);
+                    setFetchDate(e.target.value);
+                  }}
                 />
-                <Button variant="outline" size="sm" onClick={handleFetchThisDate} disabled={loading || syncing} className="shrink-0">
+                <Button
+                  variant="default"
+                  size="sm"
+                  onClick={() => void handleRecoverMissing()}
+                  disabled={loading || syncing || recovering || uploading}
+                  className="shrink-0"
+                  title="Search Gmail for a report delivered late and show it on this day"
+                >
+                  <Search className={`h-3.5 w-3.5 mr-1.5 ${recovering ? "animate-pulse" : ""}`} />
+                  {recovering ? "Searching…" : "Recover from Gmail"}
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => csvUploadRef.current?.click()}
+                  disabled={loading || syncing || recovering || uploading}
+                  className="shrink-0"
+                  title="Upload a .csv or Excel (.xlsx) file for this day if the email never arrived"
+                >
+                  <Upload className="h-3.5 w-3.5 mr-1.5" />
+                  {uploading ? "Uploading…" : "Upload file"}
+                </Button>
+                <input
+                  ref={csvUploadRef}
+                  type="file"
+                  accept=".csv,.xlsx,.xls,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel"
+                  className="hidden"
+                  onChange={(e) => {
+                    const f = e.target.files?.[0];
+                    e.target.value = "";
+                    if (f) void handleUploadReportFile(f);
+                  }}
+                />
+                <Button variant="outline" size="sm" onClick={handleFetchThisDate} disabled={loading || syncing} className="shrink-0 hidden md:inline-flex">
                   <RefreshCw className={`h-3.5 w-3.5 mr-1.5 ${syncing ? "animate-spin" : ""}`} />
-                  Fetch this date
+                  Fetch received date
                 </Button>
               </div>
               <div className="min-w-0">
@@ -749,67 +930,29 @@ export default function DailyAlerts() {
                   </Button>
                 </div>
                 {selectedEmail ? (
-                  <span className="text-xs text-muted-foreground tabular-nums">{formatReportDate(selectedEmail)}</span>
+                  <span className="text-xs text-muted-foreground tabular-nums">
+                    {emailCalendarDateKey(selectedEmail) !== emailReceivedDateKey(selectedEmail)
+                      ? `Report day ${emailCalendarDateKey(selectedEmail)} · Gmail received ${emailReceivedDateKey(selectedEmail)}`
+                      : formatReportDate(selectedEmail)}
+                  </span>
                 ) : null}
               </div>
-              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-                <Card className="border border-border/80 shadow-sm bg-primary/5 rounded-xl">
-                  <CardContent className="p-4 sm:p-5">
-                    <div className="flex items-center gap-2 mb-3">
-                      <CalendarIcon className="h-5 w-5 text-primary shrink-0" />
-                      <p className="text-xs font-semibold text-primary uppercase tracking-wide">Month data</p>
-                    </div>
-                    <p className="text-xl font-bold text-foreground mb-4 tabular-nums">{monthStats.total} alerts</p>
-                    <dl className="grid grid-cols-1 sm:grid-cols-2 gap-x-8 gap-y-3 text-sm">
-                      {(
-                        [
-                          ["Open", monthStats.open],
-                          ["Closed", monthStats.closed],
-                          ["Merged", monthStats.merged],
-                          ["Confirmation pending from End user", monthStats.pending],
-                          ["In progress", monthStats.inProgress],
-                          ["Incident auto closed", monthStats.incidentAutoClosed],
-                        ] as const
-                      ).map(([label, val]) => (
-                        <div key={label} className="flex items-baseline justify-between gap-4 min-w-0">
-                          <dt className="text-muted-foreground leading-snug">{label}</dt>
-                          <dd className="font-semibold tabular-nums text-foreground shrink-0">{val}</dd>
-                        </div>
-                      ))}
-                    </dl>
-                  </CardContent>
-                </Card>
-                <Card className="border border-border/80 shadow-sm bg-blue-500/5 rounded-xl">
-                  <CardContent className="p-4 sm:p-5">
-                    <div className="flex items-center gap-2 mb-2">
-                      <FileText className="h-5 w-5 text-blue-600 dark:text-blue-400 shrink-0" />
-                      <p className="text-xs font-semibold text-blue-700 dark:text-blue-300 uppercase tracking-wide">
-                        Report date
-                      </p>
-                    </div>
-                    <p className="text-xs text-muted-foreground mb-3 truncate">
-                      {selectedEmail ? formatReportDate(selectedEmail) : "—"}
-                    </p>
-                    <p className="text-xl font-bold text-foreground mb-4 tabular-nums">{selectedDateStats.total} alerts</p>
-                    <dl className="grid grid-cols-1 sm:grid-cols-2 gap-x-8 gap-y-3 text-sm">
-                      {(
-                        [
-                          ["Open", selectedDateStats.open],
-                          ["Closed", selectedDateStats.closed],
-                          ["Merged", selectedDateStats.merged],
-                          ["Confirmation pending from End user", selectedDateStats.pending],
-                          ["In progress", selectedDateStats.inProgress],
-                          ["Incident auto closed", selectedDateStats.incidentAutoClosed],
-                        ] as const
-                      ).map(([label, val]) => (
-                        <div key={label} className="flex items-baseline justify-between gap-4 min-w-0">
-                          <dt className="text-muted-foreground leading-snug">{label}</dt>
-                          <dd className="font-semibold tabular-nums text-foreground shrink-0">{val}</dd>
-                        </div>
-                      ))}
-                    </dl>
-                  </CardContent>
-                </Card>
+              <div className="grid grid-cols-1 xl:grid-cols-2 gap-3 w-full">
+                <ReportStatusSummaryCard
+                  variant="primary"
+                  title="Month data"
+                  total={monthStats.total}
+                  counts={monthStats}
+                  pendingLabel="Confirmation pending from End user"
+                />
+                <ReportStatusSummaryCard
+                  variant="blue"
+                  title="Report date"
+                  subtitle={selectedEmail ? formatReportDate(selectedEmail) : "—"}
+                  total={selectedDateStats.total}
+                  counts={selectedDateStats}
+                  pendingLabel="Confirmation pending from End user"
+                />
               </div>
             </div>
           )}
@@ -877,6 +1020,39 @@ export default function DailyAlerts() {
               </p>
             )}
           </div>
+
+          <Dialog open={recoverDialogOpen} onOpenChange={setRecoverDialogOpen}>
+            <DialogContent className="max-w-lg">
+              <DialogHeader>
+                <DialogTitle>Which email is the report for {recoverTargetDate}?</DialogTitle>
+                <DialogDescription>
+                  Several daily reports arrived after that day. Pick the one that covers {recoverTargetDate}.
+                </DialogDescription>
+              </DialogHeader>
+              <ul className="space-y-2 max-h-[min(50vh,20rem)] overflow-y-auto">
+                {recoverCandidates.map((c) => (
+                  <li key={c.messageId}>
+                    <Button
+                      variant="outline"
+                      className="w-full justify-start h-auto py-3 text-left"
+                      disabled={recovering}
+                      onClick={() => void handleAssignRecoverCandidate(c.messageId)}
+                    >
+                      <span className="block font-medium truncate">{c.subject ?? "PB Daily report"}</span>
+                      <span className="block text-xs text-muted-foreground mt-1">
+                        Received {c.receivedDate ?? "—"} · {c.rowCount} row(s)
+                      </span>
+                    </Button>
+                  </li>
+                ))}
+              </ul>
+              <DialogFooter>
+                <Button variant="ghost" onClick={() => setRecoverDialogOpen(false)}>
+                  Cancel
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
 
           <EmailDetailSheet
             email={trailEmail}

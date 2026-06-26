@@ -2,7 +2,7 @@
  * Gmail API – used by incident management (inbox) and alerts.
  * Keeps all Gmail endpoints in one place so page components stay thin.
  */
-import api from "./client";
+import api, { waitForBackend } from "./client";
 import type { GmailMessage } from "@/types/gmail";
 
 /** Lookback for incident/ticket ID search; must stay ≤ backend max (`newer_than_days` in main.py, currently 450). */
@@ -68,6 +68,8 @@ export interface LatestStatusFromEmailResult {
   error?: string;
   /** When no closure found, number of emails we scanned (for debugging). */
   emailsChecked?: number;
+  /** Gmail search returned no messages for this incident/ticket token. */
+  notFound?: boolean;
 }
 
 /** Fetch latest email for incident/ticket and get suggested status from body (e.g. "please close this alert"). Uses any sender so closure emails from anybody are found. */
@@ -87,6 +89,123 @@ export async function fetchLatestStatusFromEmail(params: {
   if (from?.trim()) search.set("from", from.trim());
   const res = await api.get<LatestStatusFromEmailResult>(`/gmail/latest-status?${search.toString()}`);
   return res ?? { suggestedStatus: null };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRetryableLatestStatusError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const m = err.message.toLowerCase();
+  return (
+    m.includes("failed to fetch") ||
+    m.includes("networkerror") ||
+    m.includes("load failed") ||
+    m.includes("connection refused") ||
+    m.includes("429") ||
+    m.includes("rate") ||
+    m.includes("quota") ||
+    m.includes("503") ||
+    m.includes("502") ||
+    m.includes("timeout") ||
+    m.includes("connection reset") ||
+    m.includes("econnreset")
+  );
+}
+
+function isBackendDownError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const m = err.message.toLowerCase();
+  return (
+    m.includes("failed to fetch") ||
+    m.includes("networkerror") ||
+    m.includes("load failed") ||
+    m.includes("connection refused")
+  );
+}
+
+/** Retry transient Gmail / network failures during long "Fetch all" runs. */
+export async function fetchLatestStatusFromEmailResilient(
+  params: Parameters<typeof fetchLatestStatusFromEmail>[0],
+  maxAttempts = 3
+): Promise<LatestStatusFromEmailResult> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      if (attempt > 0) {
+        const backoff = isBackendDownError(lastErr) ? 3000 * attempt : 400 * attempt;
+        await sleep(Math.min(backoff, 10_000));
+        if (isBackendDownError(lastErr)) {
+          await waitForBackend(20_000, 5_000);
+        }
+      }
+      return await fetchLatestStatusFromEmail(params);
+    } catch (e) {
+      lastErr = e;
+      if (!isRetryableLatestStatusError(e) || attempt === maxAttempts - 1) throw e;
+    }
+  }
+  throw lastErr;
+}
+
+export type LatestStatusBatchItem = {
+  id: string;
+  queries: string[];
+};
+
+export type LatestStatusBatchResult = LatestStatusFromEmailResult & {
+  id: string;
+  error?: string;
+};
+
+export interface LatestStatusBatchResponse {
+  results: LatestStatusBatchResult[];
+  error?: string;
+}
+
+/** Server-side batch closure lookup — one HTTP call processes many rows (Fetch all). */
+export async function postGmailLatestStatusBatch(body: {
+  items: LatestStatusBatchItem[];
+  newerThanDays?: number;
+}): Promise<LatestStatusBatchResponse> {
+  const { items, newerThanDays = GMAIL_INCIDENT_LOOKUP_LOOKBACK_DAYS } = body;
+  return api.post<LatestStatusBatchResponse>("/gmail/latest-status-batch", {
+    items,
+    newer_than_days: newerThanDays,
+  });
+}
+
+function isRetryableBatchError(err: unknown): boolean {
+  return isRetryableLatestStatusError(err);
+}
+
+/** Retry whole batch on connection drops (Flask restart / transient network). */
+export async function postGmailLatestStatusBatchResilient(
+  body: Parameters<typeof postGmailLatestStatusBatch>[0],
+  maxAttempts = 3
+): Promise<LatestStatusBatchResponse> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      if (attempt > 0) {
+        await sleep(3000 * attempt);
+        if (isBackendDownError(lastErr)) {
+          const up = await waitForBackend(30_000, 5_000);
+          if (!up) {
+            throw new Error(
+              "Backend unavailable. Restart python main.py in Backend/, then click Resume."
+            );
+          }
+        }
+      }
+      return await postGmailLatestStatusBatch(body);
+    } catch (e) {
+      lastErr = e;
+      if (!isRetryableBatchError(e) || attempt === maxAttempts - 1) throw e;
+    }
+  }
+  throw lastErr;
 }
 
 /** Per-rule Gmail search result (SIEM Master ↔ mailbox analysis). */
@@ -115,6 +234,76 @@ export interface GmailRuleHitsResponse {
   results: GmailRuleHitRow[];
 }
 
+/** Latest id per SIEM rule for each calendar month column (INC preferred, CS fallback). */
+export interface SiemRuleMonthIncidentCell {
+  latest_incident_id: string | null;
+  latest_case_id?: string | null;
+  /** Value written to the month cell: INC when found, else CS. */
+  mapped_id?: string | null;
+  email_date_iso?: string | null;
+  subject?: string | null;
+  messages_scanned?: number;
+  gmail_query?: string;
+  search_token?: string;
+  error?: string;
+}
+
+export interface SiemRuleLatestIncidentsRow {
+  rule_name: string;
+  row_id: string | null;
+  by_month: Record<string, SiemRuleMonthIncidentCell>;
+}
+
+export interface SiemRuleLatestIncidentsResponse {
+  from_filter: string | null;
+  results: SiemRuleLatestIncidentsRow[];
+  lookups_performed: number;
+}
+
+export type SiemRuleLatestIncidentsItem = {
+  rule_name: string;
+  row_id?: string;
+  months: Array<{ label: string; after_date: string; before_date: string }>;
+};
+
+/** For each rule row and month window, find the newest matching Gmail alert; map INC, else CS. */
+export async function postGmailSiemRuleLatestIncidents(body: {
+  items: SiemRuleLatestIncidentsItem[];
+  fromFilter?: string;
+}): Promise<SiemRuleLatestIncidentsResponse> {
+  const { items, fromFilter } = body;
+  return api.post<SiemRuleLatestIncidentsResponse>(
+    "/gmail/siem-rule-latest-incidents",
+    {
+      items: items.map((item) => ({
+        rule_name: item.rule_name,
+        row_id: item.row_id,
+        months: item.months,
+      })),
+      ...(fromFilter?.trim() ? { from_filter: fromFilter.trim() } : {}),
+    },
+    { credentials: "include" }
+  );
+}
+
+function isNetworkFetchError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const m = err.message.toLowerCase();
+  return m.includes("failed to fetch") || m.includes("networkerror") || m.includes("load failed");
+}
+
+/** Retry once on connection drops (e.g. Flask dev server reload mid-request). */
+export async function postGmailSiemRuleLatestIncidentsResilient(
+  body: Parameters<typeof postGmailSiemRuleLatestIncidents>[0]
+): Promise<SiemRuleLatestIncidentsResponse> {
+  try {
+    return await postGmailSiemRuleLatestIncidents(body);
+  } catch (e) {
+    if (!isNetworkFetchError(e)) throw e;
+    return await postGmailSiemRuleLatestIncidents(body);
+  }
+}
+
 /** Map SIEM Master rule names to Gmail message counts in a date range (uses leading rule id when present). */
 export async function postGmailRuleHits(body: {
   ruleNames: string[];
@@ -123,6 +312,7 @@ export async function postGmailRuleHits(body: {
   fromFilter?: string;
   maxResultsPerRule?: number;
   sampleN?: number;
+  forceRefresh?: boolean;
 }): Promise<GmailRuleHitsResponse> {
   const {
     ruleNames,
@@ -131,6 +321,7 @@ export async function postGmailRuleHits(body: {
     fromFilter,
     maxResultsPerRule = 500,
     sampleN = 3,
+    forceRefresh = false,
   } = body;
   return api.post<GmailRuleHitsResponse>("/gmail/rule-hits", {
     rule_names: ruleNames,
@@ -139,5 +330,47 @@ export async function postGmailRuleHits(body: {
     ...(fromFilter?.trim() ? { from_filter: fromFilter.trim() } : {}),
     max_results_per_rule: maxResultsPerRule,
     sample_n: sampleN,
+    ...(forceRefresh ? { force_refresh: true } : {}),
+  });
+}
+
+/** Retry once on connection drops (Flask restart/reload mid-request). */
+export async function postGmailRuleHitsResilient(
+  body: Parameters<typeof postGmailRuleHits>[0]
+): Promise<GmailRuleHitsResponse> {
+  try {
+    return await postGmailRuleHits(body);
+  } catch (e) {
+    if (!isNetworkFetchError(e)) throw e;
+    return await postGmailRuleHits(body);
+  }
+}
+
+export interface GmailRuleHitsCacheHit {
+  rule_name: string;
+  month_label: string;
+  after_date: string;
+  before_date: string;
+  match_count: number;
+  capped_at_max: boolean;
+  cached_at?: string | null;
+}
+
+export interface GmailRuleHitsCacheBulkResponse {
+  from_filter: string | null;
+  hits: GmailRuleHitsCacheHit[];
+}
+
+/** Read cached mailbox hit counts from SQLite (no Gmail API). */
+export async function postGmailRuleHitsCacheBulk(body: {
+  windows: Array<{ month_label: string; after_date: string; before_date: string }>;
+  ruleNames?: string[];
+  fromFilter?: string;
+}): Promise<GmailRuleHitsCacheBulkResponse> {
+  const { windows, ruleNames, fromFilter } = body;
+  return api.post<GmailRuleHitsCacheBulkResponse>("/gmail/rule-hits-cache/bulk", {
+    windows,
+    ...(ruleNames?.length ? { rule_names: ruleNames } : {}),
+    ...(fromFilter?.trim() ? { from_filter: fromFilter.trim() } : {}),
   });
 }

@@ -1,5 +1,5 @@
 import { useMemo, useState, useCallback, useEffect, useRef } from "react";
-import { useLocation, Link } from "react-router-dom";
+import { useLocation } from "react-router-dom";
 import { SidebarProvider, SidebarInset } from "@/components/ui/sidebar";
 import { SOCSidebar } from "@/components/SOCSidebar";
 import { ThemeToggle } from "@/components/ThemeToggle";
@@ -7,8 +7,12 @@ import { NotificationsPanel } from "@/components/NotificationsPanel";
 import { CsvDataTable } from "@/components/CsvDataTable";
 import { EmailDetailSheet } from "@/components/EmailDetailSheet";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Tabs, TabsContent } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
+import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
+import { Badge } from "@/components/ui/badge";
+import { Calendar as DatePickerCalendar } from "@/components/ui/calendar";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
   Select,
   SelectContent,
@@ -20,28 +24,35 @@ import {
   RefreshCw,
   ChevronLeft,
   ChevronRight,
-  Calendar,
+  Calendar as CalendarIcon,
   CalendarRange,
   FileText,
   Download,
   LayoutGrid,
   BarChart3,
-  Radar,
 } from "lucide-react";
 import { API_BASE_URL } from "@/api/client";
 import { useWeeklyReportData } from "@/hooks/useWeeklyReportData";
+import { useReportAlertsByDate } from "@/hooks/useReportAlertsByDate";
 import {
   upsertOverride,
   importOverrides,
+  bulkUpsertOverrides,
+  fetchClosureBatchResilient,
   type OverrideField,
   type ImportOverridesItem,
   type WeeklyOverrideRecord,
+  type FetchClosureBatchResult,
   WeeklyReportsAuthError,
 } from "@/api/weeklyReports";
 import {
+  overrideMapsFromReport,
+  unifiedRowKey,
+  rowCreationDateKey,
+  persistUnifiedReportOverride,
+} from "@/lib/reportAlertUtils";
+import {
   getGmailMessageBySearch,
-  fetchLatestStatusFromEmail,
-  type LatestStatusFromEmailResult,
 } from "@/api/gmail";
 import { toast } from "@/hooks/use-toast";
 import type { GmailMessage, CsvAttachment } from "@/types/gmail";
@@ -50,7 +61,19 @@ import {
   downloadCsvAsXlsx,
   buildConsolidatedWeeklyReportsCsv,
 } from "@/lib/exportReportSheetXlsx";
-import { YearlyFyTrendSection, YearlyFyCoverageSection, type YearlyMonthTrendRow } from "@/components/weekly/YearlyFyInsights";
+import { YearlyFyTrendSection, type YearlyMonthTrendRow } from "@/components/weekly/YearlyFyInsights";
+import { ReportStatusSummaryCard } from "@/components/ReportStatusSummaryCard";
+import { FetchAllReportButtons, type FetchAllProgressState } from "@/components/FetchAllReportButtons";
+import {
+  canResumeFetchAll,
+  clearFetchAllProgress as clearFetchAllCheckpoint,
+  setFetchAllProgress as saveFetchAllCheckpoint,
+} from "@/lib/fetchAllProgress";
+import { waitForBackend } from "@/api/client";
+import {
+  buildFetchAllGmailQueries,
+  FETCH_ALL_GMAIL_BATCH_SIZE,
+} from "@/lib/fetchAllGmailQueries";
 
 const WEEKLY_REPORTS_SENDER = "PB_weekly@global.ntt";
 const WEEKLY_REPORTS_SUBJECT = "PB Weekly report";
@@ -308,6 +331,23 @@ function formatReportDate(email: GmailMessage): string {
   });
 }
 
+function formatWeekLabel(weekStartIso: string): string {
+  const d = new Date(weekStartIso + "T12:00:00");
+  return `Week of ${d.toLocaleDateString(undefined, { day: "2-digit", month: "short", year: "numeric" })}`;
+}
+
+function emailCalendarDateKey(email: GmailMessage): string {
+  const ts = parseEmailDate(email);
+  const d = new Date(ts);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+function parseISODateLocal(ymd: string): Date {
+  const [y, m, d] = ymd.split("-").map(Number);
+  return new Date(y, m - 1, d);
+}
+
 /** Find row value by header key (case-insensitive match). */
 function getRowValue(row: Record<string, string>, ...possibleKeys: string[]): string {
   const keys = Object.keys(row);
@@ -427,7 +467,10 @@ export default function WeeklyReports() {
   const [selectedYear, setSelectedYear] = useState(currentYear);
   const [selectedMonth, setSelectedMonth] = useState(currentMonth);
   const [fetchingAllStatus, setFetchingAllStatus] = useState(false);
-  const [fetchAllProgress, setFetchAllProgress] = useState<{ current: number; total: number } | null>(null);
+  const [fetchAllProgress, setFetchAllProgress] = useState<FetchAllProgressState | null>(null);
+  const [fetchAllResumeVersion, setFetchAllResumeVersion] = useState(0);
+  const [yearlySection, setYearlySection] = useState<"reports" | "analysis">("reports");
+  const [fetchScope, setFetchScope] = useState<"date" | "range">("range");
 
   const { afterDate, beforeDate } = useMemo(() => {
     if (isYearlyView) {
@@ -451,6 +494,16 @@ export default function WeeklyReports() {
     beforeDate,
     maxResults: isYearlyView ? YEARLY_MAX_RESULTS : 2000,
   });
+
+  const {
+    alertsCsv: reportAlertsCsv,
+    overrides: reportOverrides,
+    summary: reportAlertsSummary,
+    loading: reportAlertsLoading,
+    error: reportAlertsError,
+    loadRange: loadReportAlerts,
+    setLocalOverride: setReportLocalOverride,
+  } = useReportAlertsByDate();
 
   // Legacy `useGmailMessages` exposed `loading` + `isHydratingFromCache`. The
   // DB-backed hook splits its work into `dbLoading` (server read) and `syncing`
@@ -503,6 +556,49 @@ export default function WeeklyReports() {
     }
     return out;
   }, [serverOverrides]);
+
+  const reportOverrideMaps = useMemo(() => overrideMapsFromReport(reportOverrides), [reportOverrides]);
+  const reportStatusOverrides = reportOverrideMaps.status;
+  const reportClosureCommentsOverrides = reportOverrideMaps.closureComments;
+  const reportClosureDateOverrides = reportOverrideMaps.closureDate;
+
+  const getUnifiedRowKey = useCallback(
+    () => (row: Record<string, string>) => unifiedRowKey(row),
+    []
+  );
+
+  const [yearlyCreationScope, setYearlyCreationScope] = useState<"date" | "range">("date");
+  const [yearlyCreationDate, setYearlyCreationDate] = useState<string>(() => toYYYYMMDD(new Date()));
+  const [yearlyCreationRange, setYearlyCreationRange] = useState<{
+    from: Date | undefined;
+    to: Date | undefined;
+  }>({ from: undefined, to: undefined });
+  const [yearlyCreationCalendarOpen, setYearlyCreationCalendarOpen] = useState(false);
+
+  useEffect(() => {
+    if (!isYearlyView) return;
+    void loadReportAlerts(activeYearlyFy.afterDate, activeYearlyFy.beforeDate);
+  }, [isYearlyView, activeYearlyFy.afterDate, activeYearlyFy.beforeDate, loadReportAlerts]);
+
+  const filteredYearlyReportRows = useMemo(() => {
+    if (!reportAlertsCsv?.rows?.length) return [];
+    const rows = reportAlertsCsv.rows;
+    if (yearlyCreationScope === "date") {
+      return rows.filter((r) => rowCreationDateKey(r) === yearlyCreationDate);
+    }
+    const from = yearlyCreationRange.from ? toYYYYMMDD(yearlyCreationRange.from) : null;
+    const to = yearlyCreationRange.to
+      ? toYYYYMMDD(yearlyCreationRange.to)
+      : yearlyCreationRange.from
+        ? toYYYYMMDD(yearlyCreationRange.from)
+        : null;
+    if (!from) return rows;
+    return rows.filter((r) => {
+      const d = rowCreationDateKey(r);
+      if (!d) return true;
+      return d >= from && (!to || d <= to);
+    });
+  }, [reportAlertsCsv, yearlyCreationScope, yearlyCreationDate, yearlyCreationRange]);
 
   const emailsSortedByDate = useMemo(() => {
     return [...emails].sort((a, b) => parseEmailDate(a) - parseEmailDate(b));
@@ -558,13 +654,27 @@ export default function WeeklyReports() {
     return afterDate;
   }, [isYearlyView, afterDate, activeYearlyFy]);
 
+  const reloadYearlyReportAlerts = useCallback(() => {
+    if (!isYearlyView) return;
+    void loadReportAlerts(activeYearlyFy.afterDate, activeYearlyFy.beforeDate);
+  }, [isYearlyView, activeYearlyFy.afterDate, activeYearlyFy.beforeDate, loadReportAlerts]);
+
   const handleFetchThisDate = useCallback(() => {
     const after = fetchDate;
     const before = nextDay(fetchDate);
     refetchDateRange(after, before).then(() => {
+      reloadYearlyReportAlerts();
       toast({ title: "Date fetched", description: `Data for ${fetchDate} merged into month view.` });
     });
-  }, [fetchDate, refetchDateRange]);
+  }, [fetchDate, refetchDateRange, reloadYearlyReportAlerts]);
+
+  const handleFetchSelectedScope = useCallback(() => {
+    if (fetchScope === "date") {
+      handleFetchThisDate();
+      return;
+    }
+    void refetch().then(() => reloadYearlyReportAlerts());
+  }, [fetchScope, handleFetchThisDate, refetch, reloadYearlyReportAlerts]);
 
   useEffect(() => {
     setFetchDate(fetchDateForMonth);
@@ -576,18 +686,84 @@ export default function WeeklyReports() {
    * Reset to `null` whenever the month / FY context changes so the new period also opens on its latest report.
    */
   const [selectedReportIndex, setSelectedReportIndex] = useState<number | null>(null);
+  const [yearlyAlertDate, setYearlyAlertDate] = useState<string>("");
+  const [yearlyCalendarOpen, setYearlyCalendarOpen] = useState(false);
+  const [yearlyCalendarMonth, setYearlyCalendarMonth] = useState<Date>(() => new Date());
   const safeReportIndex = useMemo(() => {
     if (emailsWithCsvDisplay.length === 0) return 0;
     if (selectedReportIndex == null) return emailsWithCsvDisplay.length - 1;
     return Math.min(Math.max(0, selectedReportIndex), emailsWithCsvDisplay.length - 1);
   }, [emailsWithCsvDisplay.length, selectedReportIndex]);
-  const selectedEmail = emailsWithCsvDisplay[safeReportIndex] ?? null;
+
+  const yearlyAlertOptions = useMemo(() => {
+    if (!isYearlyView) return [] as Array<{
+      email: GmailMessage;
+      year: string;
+      month: string;
+      monthLabel: string;
+      week: string;
+      weekLabel: string;
+      date: string;
+      dateLabel: string;
+      ts: number;
+    }>;
+    return [...emailsWithCsvDisplay]
+      .map((email) => {
+        const ts = parseEmailDate(email);
+        const d = new Date(ts);
+        return {
+          email,
+          year: String(d.getFullYear()),
+          month: String(d.getMonth() + 1).padStart(2, "0"),
+          monthLabel: d.toLocaleDateString(undefined, { month: "long" }),
+          week: startOfWeekMondayFromTs(ts),
+          weekLabel: formatWeekLabel(startOfWeekMondayFromTs(ts)),
+          date: toYYYYMMDD(d),
+          dateLabel: formatReportDate(email),
+          ts,
+        };
+      })
+      .sort((a, b) => a.ts - b.ts);
+  }, [isYearlyView, emailsWithCsvDisplay]);
+
+  const latestYearlyAlert = yearlyAlertOptions[yearlyAlertOptions.length - 1] ?? null;
+
+  useEffect(() => {
+    if (!isYearlyView) return;
+    if (!latestYearlyAlert) {
+      setYearlyAlertDate("");
+      return;
+    }
+    setYearlyAlertDate((prev) => (yearlyAlertOptions.some((o) => o.date === prev) ? prev : latestYearlyAlert.date));
+  }, [isYearlyView, latestYearlyAlert, yearlyAlertOptions]);
+
+  useEffect(() => {
+    if (!isYearlyView || !yearlyAlertDate) return;
+    setYearlyCalendarMonth(parseISODateLocal(yearlyAlertDate));
+  }, [isYearlyView, yearlyAlertDate]);
+
+  const yearlyReportDateSet = useMemo(() => new Set(yearlyAlertOptions.map((o) => o.date)), [yearlyAlertOptions]);
+
+  const selectedYearlyEmail = useMemo(() => {
+    const match = yearlyAlertOptions.find((o) => o.date === yearlyAlertDate);
+    return match?.email ?? latestYearlyAlert?.email ?? null;
+  }, [yearlyAlertOptions, yearlyAlertDate, latestYearlyAlert]);
+
+  const selectedEmail = isYearlyView ? selectedYearlyEmail : emailsWithCsvDisplay[safeReportIndex] ?? null;
 
   useEffect(() => {
     setSelectedReportIndex(null);
   }, [yearlyFyId, isYearlyView, selectedYear, selectedMonth]);
 
   const monthStats = useMemo(() => {
+    if (isYearlyView && reportAlertsCsv?.headers?.length && reportAlertsCsv.rows.length) {
+      return countByStatus(
+        reportAlertsCsv.rows,
+        reportAlertsCsv.headers,
+        getUnifiedRowKey(),
+        reportStatusOverrides
+      );
+    }
     let total = 0;
     const counts = { open: 0, closed: 0, inProgress: 0, pending: 0, merged: 0, incidentAutoClosed: 0 };
     for (const email of emailsWithCsvDisplay) {
@@ -610,7 +786,15 @@ export default function WeeklyReports() {
       counts.incidentAutoClosed += c.incidentAutoClosed;
     }
     return { total, ...counts };
-  }, [emailsWithCsvDisplay, statusOverrides, getRowKey]);
+  }, [
+    isYearlyView,
+    reportAlertsCsv,
+    getUnifiedRowKey,
+    reportStatusOverrides,
+    emailsWithCsvDisplay,
+    statusOverrides,
+    getRowKey,
+  ]);
 
   const yearlyMonthTrend = useMemo((): YearlyMonthTrendRow[] => {
     if (!isYearlyView) return [];
@@ -676,6 +860,14 @@ export default function WeeklyReports() {
   }, [isYearlyView, emailsSortedByDate, emailsWithCsv.length, activeYearlyFy]);
 
   const csvForTable = useMemo((): CsvAttachment | null => {
+    if (isYearlyView) {
+      if (!reportAlertsCsv?.headers?.length) return null;
+      return {
+        filename: reportAlertsCsv.filename || "pb_alerts.csv",
+        headers: reportAlertsCsv.headers,
+        rows: filteredYearlyReportRows,
+      };
+    }
     if (!selectedEmail?.csvAttachment) return null;
     const { filename, headers, rows } = selectedEmail.csvAttachment;
     return {
@@ -688,15 +880,41 @@ export default function WeeklyReports() {
         return { ...r, __rowIndex: idxStr };
       }),
     };
-  }, [selectedEmail?.csvAttachment, selectedEmail?.id]);
+  }, [
+    isYearlyView,
+    reportAlertsCsv,
+    filteredYearlyReportRows,
+    selectedEmail?.csvAttachment,
+    selectedEmail?.id,
+  ]);
 
   const selectedDateStats = useMemo(() => {
+    if (isYearlyView) {
+      if (!reportAlertsCsv?.headers?.length)
+        return { total: 0, open: 0, closed: 0, inProgress: 0, pending: 0, merged: 0, incidentAutoClosed: 0 };
+      return countByStatus(
+        filteredYearlyReportRows,
+        reportAlertsCsv.headers,
+        getUnifiedRowKey(),
+        reportStatusOverrides
+      );
+    }
     if (!csvForTable)
       return { total: 0, open: 0, closed: 0, inProgress: 0, pending: 0, merged: 0, incidentAutoClosed: 0 };
     const { headers, rows } = csvForTable;
     const rk = selectedEmail ? getRowKey(selectedEmail.id) : () => "";
     return countByStatus(rows, headers, rk, statusOverrides);
-  }, [csvForTable, selectedEmail, getRowKey, statusOverrides]);
+  }, [
+    isYearlyView,
+    reportAlertsCsv,
+    filteredYearlyReportRows,
+    getUnifiedRowKey,
+    reportStatusOverrides,
+    csvForTable,
+    selectedEmail,
+    getRowKey,
+    statusOverrides,
+  ]);
 
   const [trailEmail, setTrailEmail] = useState<GmailMessage | null>(null);
   const [trailLoading, setTrailLoading] = useState(false);
@@ -725,12 +943,12 @@ export default function WeeklyReports() {
       row: Record<string, string>,
       field: OverrideField,
       value: string,
-      fallbackIndex: number = 0
+      fallbackIndex: number = 0,
+      options?: { silent?: boolean }
     ) => {
       const rowIndex = resolveRowIndex(row, fallbackIndex);
       const actorEmail =
         currentUser && currentUser !== "anonymous" ? currentUser.email : undefined;
-      // Optimistic local update first so the cell doesn't flash old value during the round-trip.
       setLocalOverride(
         emailId,
         rowIndex,
@@ -741,6 +959,7 @@ export default function WeeklyReports() {
       try {
         await upsertOverride({ messageId: emailId, rowIndex, field, value });
       } catch (err) {
+        if (options?.silent) return;
         if (err instanceof WeeklyReportsAuthError) {
           toast({
             title: "Sign in to Gmail",
@@ -758,6 +977,45 @@ export default function WeeklyReports() {
       }
     },
     [currentUser, resolveRowIndex, setLocalOverride]
+  );
+
+  const persistReportOverride = useCallback(
+    async (row: Record<string, string>, field: OverrideField, value: string) => {
+      const key = unifiedRowKey(row);
+      if (!key) return;
+      setReportLocalOverride(key, field, value);
+      try {
+        await persistUnifiedReportOverride(row, field, value);
+      } catch (err) {
+        toast({
+          title: "Could not save edit",
+          description: err instanceof Error ? err.message : String(err),
+          variant: "destructive",
+        });
+      }
+    },
+    [setReportLocalOverride]
+  );
+
+  const handleReportStatusChange = useCallback(
+    (row: Record<string, string>, newStatus: string) => {
+      void persistReportOverride(row, "status", newStatus);
+    },
+    [persistReportOverride]
+  );
+
+  const handleReportClosureCommentsChange = useCallback(
+    (row: Record<string, string>, newValue: string) => {
+      void persistReportOverride(row, "closure_comment", newValue);
+    },
+    [persistReportOverride]
+  );
+
+  const handleReportClosureDateChange = useCallback(
+    (row: Record<string, string>, newValue: string) => {
+      void persistReportOverride(row, "closure_date", newValue);
+    },
+    [persistReportOverride]
   );
 
   const handleStatusChange = useCallback(
@@ -861,86 +1119,260 @@ export default function WeeklyReports() {
     }
   }, [refetch]);
 
-  const handleFetchAllLatestStatus = useCallback(async () => {
-    if (!selectedEmail?.csvAttachment?.rows?.length) {
+  const fetchAllResume = useMemo(() => {
+    const rows = csvForTable?.rows;
+    if (!selectedEmail?.id || !rows?.length) {
+      return { canResume: false, resumeFromIndex: 0 };
+    }
+    return canResumeFetchAll(selectedEmail.id, rows.length);
+    // fetchAllResumeVersion: bump after run completes or report changes
+  }, [selectedEmail?.id, csvForTable?.rows?.length, fetchAllResumeVersion]);
+
+  useEffect(() => {
+    setFetchAllResumeVersion((v) => v + 1);
+  }, [selectedEmail?.id]);
+
+  const handleFetchAllLatestStatus = useCallback(
+    async (startFromBeginning = false) => {
+    if (!csvForTable?.rows?.length || !selectedEmail) {
       toast({ title: "No data", description: "Load a weekly report with CSV rows first.", variant: "destructive" });
       return;
     }
     const emailId = selectedEmail.id;
-    const rows = selectedEmail.csvAttachment.rows;
-    const headers = selectedEmail.csvAttachment.headers ?? [];
+    const rows = csvForTable.rows;
+    const headers = csvForTable.headers ?? [];
     const rk = getRowKey(emailId);
+    const total = rows.length;
+
+    if (startFromBeginning) {
+      clearFetchAllCheckpoint(emailId);
+    }
+    const resumeInfo = startFromBeginning
+      ? { canResume: false, resumeFromIndex: 0, checkpoint: null }
+      : canResumeFetchAll(emailId, total);
+    const startIndex = resumeInfo.resumeFromIndex;
+
+    if (startFromBeginning) {
+      toast({
+        title: "Fetch all started",
+        description: `Processing all ${total} rows from row 1.`,
+      });
+    } else if (resumeInfo.canResume) {
+      toast({
+        title: "Resuming fetch all",
+        description: `Continuing at row ${startIndex + 1} of ${total}. Click “Start from row 1” to run the full report again.`,
+      });
+    }
+
     setFetchingAllStatus(true);
-    setFetchAllProgress({ current: 0, total: rows.length });
+    setFetchAllProgress({ current: startIndex + 1, total, gmailChecked: 0, updated: 0, skippedNoId: 0, mergedSkipped: 0, errors: 0, noClosureInGmail: 0, phase: "scan" });
     let updated = 0;
     let datesSet = 0;
     let mergedNtt = 0;
     let mergedDateFromCreated = 0;
-    const total = rows.length;
+    let gmailChecked = 0;
+    let skippedNoId = 0;
+    let errors = 0;
+    let consecutiveErrors = 0;
+    let aborted = false;
+    let lastSuccessfulRow = startIndex > 0 ? startIndex - 1 : -1;
+    let noClosureInGmail = 0;
+    const bumpProgress = (current: number, phase: "scan" | "gmail" = "scan") => {
+      setFetchAllProgress({
+        current,
+        total,
+        gmailChecked,
+        updated,
+        skippedNoId,
+        mergedSkipped: mergedNtt,
+        errors,
+        noClosureInGmail,
+        phase,
+      });
+    };
     try {
-      for (let i = 0; i < rows.length; i++) {
-        setFetchAllProgress({ current: i + 1, total });
-        const row = rows[i];
-        const rawIdx = (row as Record<string, unknown>).__rowIndex;
-        let idxStr = String(i);
-        if (rawIdx != null && String(rawIdx).trim() !== "") {
-          const n = Number(rawIdx);
-          idxStr = Number.isFinite(n) ? String(n) : String(i);
+      type GmailQueueItem = {
+        i: number;
+        rowIndex: number;
+        queries: string[];
+      };
+      const actorEmail =
+        currentUser && currentUser !== "anonymous" ? currentUser.email : undefined;
+
+      const applyLocalClosure = (rowIndex: number, result: FetchClosureBatchResult) => {
+        if (!result.persisted) return;
+        const statusToSet =
+          result.suggestedStatus === "Incident Auto Closed" ? "Incident Auto Closed" : "Closed";
+        const closure = (result.suggestedClosureComment ?? "").trim() || "Closed from email";
+        const dateIso = (result.matchedEmailDateIso ?? "").trim();
+        setLocalOverride(
+          emailId,
+          rowIndex,
+          "status",
+          statusToSet,
+          actorEmail ? { email: actorEmail } : undefined
+        );
+        setLocalOverride(
+          emailId,
+          rowIndex,
+          "closure_comment",
+          closure,
+          actorEmail ? { email: actorEmail } : undefined
+        );
+        if (dateIso) {
+          setLocalOverride(
+            emailId,
+            rowIndex,
+            "closure_date",
+            dateIso,
+            actorEmail ? { email: actorEmail } : undefined
+          );
         }
-        const rowWithIdx = { ...row, __rowIndex: idxStr };
-        if (headers.length) {
-          const st = normalizeStatus(getRowStatus(rowWithIdx, headers, rk, statusOverrides));
-          if (st === "Merged") {
-            const createdVal = getRowValue(row, "Created", "Created On").trim();
-            await persistOverride(emailId, rowWithIdx, "closure_comment", "NTT", i);
-            if (createdVal) {
-              mergedDateFromCreated++;
-              await persistOverride(emailId, rowWithIdx, "closure_date", createdVal, i);
+      };
+
+      /** Process CSV rows in chunks so progress shows 1, 2, 3… not jumping to first Gmail row. */
+      for (
+        let chunkStart = startIndex;
+        chunkStart < rows.length && !aborted;
+        chunkStart += FETCH_ALL_GMAIL_BATCH_SIZE
+      ) {
+        const chunkEnd = Math.min(chunkStart + FETCH_ALL_GMAIL_BATCH_SIZE, rows.length);
+        const gmailItems: GmailQueueItem[] = [];
+        const chunkMergedBulk: ImportOverridesItem[] = [];
+
+        for (let i = chunkStart; i < chunkEnd; i++) {
+          bumpProgress(i + 1);
+          const row = rows[i];
+          const rawIdx = (row as Record<string, unknown>).__rowIndex;
+          let idxStr = String(i);
+          if (rawIdx != null && String(rawIdx).trim() !== "") {
+            const n = Number(rawIdx);
+            idxStr = Number.isFinite(n) ? String(n) : String(i);
+          }
+          const rowWithIdx = { ...row, __rowIndex: idxStr };
+          const rowIndex = resolveRowIndex(rowWithIdx, i);
+          if (headers.length) {
+            const st = normalizeStatus(getRowStatus(rowWithIdx, headers, rk, statusOverrides));
+            if (st === "Merged") {
+              const createdVal = getRowValue(row, "Created", "Created On").trim();
+              chunkMergedBulk.push({
+                message_id: emailId,
+                row_index: rowIndex,
+                field: "closure_comment",
+                value: "NTT",
+              });
+              setLocalOverride(
+                emailId,
+                rowIndex,
+                "closure_comment",
+                "NTT",
+                actorEmail ? { email: actorEmail } : undefined
+              );
+              if (createdVal) {
+                mergedDateFromCreated++;
+                chunkMergedBulk.push({
+                  message_id: emailId,
+                  row_index: rowIndex,
+                  field: "closure_date",
+                  value: createdVal,
+                });
+                setLocalOverride(
+                  emailId,
+                  rowIndex,
+                  "closure_date",
+                  createdVal,
+                  actorEmail ? { email: actorEmail } : undefined
+                );
+              }
+              mergedNtt++;
+              continue;
             }
-            mergedNtt++;
+          }
+          const queries = buildFetchAllGmailQueries(row);
+          if (queries.length === 0) {
+            skippedNoId++;
             continue;
           }
+          gmailItems.push({ i, rowIndex, queries });
         }
-        const servicenowTicket = getRowValue(row, "ServicenowTicket", "ServiceNow Ticket", "ServicenowT");
-        const incidentId = getRowValue(row, "IncidentID", "Incident ID");
-        const searchFirst = servicenowTicket || incidentId;
-        const searchFallback = servicenowTicket ? incidentId : "";
-        const extraQs = extraGmailIncidentQueries(row);
-        if (!searchFirst.trim() && !searchFallback.trim() && extraQs.length === 0) continue;
+
+        if (chunkMergedBulk.length > 0) {
+          try {
+            await bulkUpsertOverrides(chunkMergedBulk);
+          } catch {
+            /* optimistic UI already updated */
+          }
+        }
+
+        const chunkLastRow = chunkEnd - 1;
+
+        if (gmailItems.length === 0) {
+          lastSuccessfulRow = chunkLastRow;
+          saveFetchAllCheckpoint(emailId, lastSuccessfulRow, total);
+          continue;
+        }
+
         try {
-          const tried = new Set<string>();
-          let result: LatestStatusFromEmailResult = { suggestedStatus: null };
-          const run = async (q: string) => {
-            const t = q.trim();
-            if (!t || tried.has(t)) return;
-            tried.add(t);
-            result = await fetchLatestStatusFromEmail({ q: t });
-          };
-          if (searchFirst.trim()) await run(searchFirst);
-          if (!result.suggestedStatus && searchFallback.trim()) await run(searchFallback);
-          if (!result.suggestedStatus) {
-            for (const q of extraQs) {
-              await run(q);
-              if (result.suggestedStatus) break;
+          const { results, updated: batchUpdated, datesSet: batchDates } =
+            await fetchClosureBatchResilient({
+              messageId: emailId,
+              items: gmailItems.map((c) => ({ row_index: c.rowIndex, queries: c.queries })),
+            });
+          gmailChecked += gmailItems.length;
+          updated += batchUpdated;
+          datesSet += batchDates;
+          bumpProgress(chunkLastRow + 1, "gmail");
+          for (const result of results) {
+            if (result.error && !result.suggestedStatus) {
+              if (result.notFound || /no matching email/i.test(result.error)) {
+                noClosureInGmail++;
+              } else {
+                errors++;
+              }
+            } else if (!result.suggestedStatus && (result.notFound || !result.error)) {
+              noClosureInGmail++;
             }
+            applyLocalClosure(result.rowIndex, result);
           }
-          if (result.suggestedStatus === "Closed" || result.suggestedStatus === "Incident Auto Closed") {
-            const statusToSet = result.suggestedStatus === "Incident Auto Closed" ? "Incident Auto Closed" : "Closed";
-            const closure = (result.suggestedClosureComment ?? "").trim() || "Closed from email";
-            const dateIso = (result.matchedEmailDateIso ?? "").trim();
-            await persistOverride(emailId, rowWithIdx, "status", statusToSet, i);
-            await persistOverride(emailId, rowWithIdx, "closure_comment", closure, i);
-            if (dateIso) {
-              datesSet++;
-              await persistOverride(emailId, rowWithIdx, "closure_date", dateIso, i);
-            }
-            updated++;
-          }
+          lastSuccessfulRow = chunkLastRow;
+          consecutiveErrors = 0;
+          saveFetchAllCheckpoint(emailId, lastSuccessfulRow, total);
         } catch {
-          /* skip row */
+          errors += gmailItems.length;
+          consecutiveErrors++;
+          if (consecutiveErrors >= 3) {
+            toast({
+              title: "Backend connection lost",
+              description: "Restart python main.py in Backend/, then click Resume.",
+            });
+            const up = await waitForBackend(30_000, 5_000);
+            if (!up) {
+              toast({
+                title: "Fetch paused",
+                description: `Stopped before row ${chunkStart + 1} of ${total}. Restart backend, then Resume.`,
+                variant: "destructive",
+              });
+              aborted = true;
+            } else {
+              consecutiveErrors = 0;
+              chunkStart -= FETCH_ALL_GMAIL_BATCH_SIZE;
+            }
+          }
+          if (lastSuccessfulRow >= startIndex) {
+            saveFetchAllCheckpoint(emailId, lastSuccessfulRow, total);
+          }
         }
       }
+      if (!aborted) {
+        clearFetchAllCheckpoint(emailId);
+      }
       const parts: string[] = [];
+      if (aborted) {
+        parts.push("checkpoint saved — use Resume after restarting the backend");
+      } else if (startIndex > 0) {
+        parts.push(`resumed from row ${startIndex + 1}`);
+      }
+      parts.push(`Gmail checked ${gmailChecked} of ${total} rows`);
       if (mergedNtt > 0) {
         parts.push(
           mergedDateFromCreated > 0
@@ -951,17 +1383,22 @@ export default function WeeklyReports() {
       if (updated > 0) {
         parts.push(datesSet > 0 ? `${updated} closed from Gmail (${datesSet} with closure date)` : `${updated} closed from Gmail`);
       }
-      if (parts.length === 0) parts.push("No rows updated");
-      parts.push(`${total - mergedNtt - updated} unchanged or skipped`);
+      if (skippedNoId > 0) parts.push(`${skippedNoId} skipped (no incident/ticket ID)`);
+      if (noClosureInGmail > 0) parts.push(`${noClosureInGmail} still open (no closure email in Gmail)`);
+      if (errors > 0) parts.push(`${errors} failed lookups (retry or resume)`);
+      if (updated === 0 && mergedNtt === 0) parts.push("No rows updated");
       toast({
-        title: "Fetch all complete (this report)",
+        title: aborted ? "Fetch paused (this report)" : "Fetch all complete (this report)",
         description: parts.join("; ") + ".",
       });
     } finally {
       setFetchingAllStatus(false);
       setFetchAllProgress(null);
+      setFetchAllResumeVersion((v) => v + 1);
     }
-  }, [selectedEmail, getRowKey, statusOverrides, persistOverride]);
+  },
+    [selectedEmail, csvForTable, getRowKey, statusOverrides, persistOverride, resolveRowIndex, setLocalOverride, currentUser]
+  );
 
   const handleDownloadXlsx = useCallback(() => {
     if (!csvForTable || !selectedEmail) {
@@ -1098,119 +1535,19 @@ export default function WeeklyReports() {
                 </div>
 
                 <div className="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between xl:gap-6 min-w-0">
-                  <div className="flex flex-wrap items-center gap-x-3 gap-y-2 rounded-xl border border-primary/25 bg-gradient-to-r from-primary/[0.06] to-card px-3 py-2 shadow-sm w-fit max-w-full">
-                    <div className="flex items-center gap-2 text-primary shrink-0">
-                      <CalendarRange className="h-4 w-4 shrink-0" aria-hidden />
-                      <span className="text-xs font-semibold uppercase tracking-wide whitespace-nowrap">FY</span>
-                      <Select value={yearlyFyId} onValueChange={setYearlyFyId}>
-                        <SelectTrigger className="h-9 w-[11rem] text-sm border-input bg-background/90">
-                          <SelectValue placeholder="Select FY" />
+                  <div className="flex min-w-0 flex-wrap items-center gap-2 xl:flex-1">
+                    <div className="flex flex-wrap items-center gap-2 rounded-lg border border-border/60 bg-muted/30 px-2 py-1.5">
+                      <span className="text-xs font-medium text-muted-foreground whitespace-nowrap">Fetch</span>
+                      <Select value={fetchScope} onValueChange={(v) => setFetchScope(v as "date" | "range")}>
+                        <SelectTrigger className="h-9 w-[11rem] bg-background">
+                          <SelectValue />
                         </SelectTrigger>
                         <SelectContent>
-                          {YEARLY_FY_OPTIONS.map((fy) => (
-                            <SelectItem key={fy.id} value={fy.id}>
-                              {fy.label}
-                            </SelectItem>
-                          ))}
+                          <SelectItem value="date">Week data</SelectItem>
+                          <SelectItem value="range">Yearly data</SelectItem>
                         </SelectContent>
                       </Select>
-                    </div>
-                    <span className="text-xs text-muted-foreground leading-snug min-w-0 sm:max-w-[20rem] xl:max-w-[24rem] border-t border-border/60 pt-2 mt-1 w-full sm:border-t-0 sm:border-l sm:pl-3 sm:pt-0 sm:mt-0 sm:w-auto">
-                      {activeYearlyFy.rangeLabel}
-                    </span>
-                    <Link
-                      to="/weekly-reports"
-                      className="text-sm font-medium text-primary hover:text-primary/80 underline-offset-2 hover:underline whitespace-nowrap"
-                    >
-                      Monthly view →
-                    </Link>
-                  </div>
-
-                  <div className="flex flex-col gap-3 min-w-0 xl:items-end">
-                    <div className="flex flex-wrap items-center gap-2 sm:gap-3">
-                      <div
-                        className="flex flex-wrap items-center gap-2 rounded-lg border border-border/60 bg-muted/30 px-2 py-1.5"
-                        role="group"
-                        aria-label="Sync from Gmail"
-                      >
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={refetch}
-                          disabled={loading}
-                          className="shrink-0 h-9"
-                          aria-label="Refresh weekly reports from Gmail"
-                        >
-                          <RefreshCw className={`h-4 w-4 sm:mr-2 ${loading ? "animate-spin" : ""}`} />
-                          <span className="hidden sm:inline">Refresh</span>
-                        </Button>
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={handleFetchAllLatestStatus}
-                          disabled={loading || fetchingAllStatus || !csvForTable?.rows.length}
-                          className="shrink-0 h-9"
-                          title="Fetch Gmail closure status for every row (Servicenow / Incident ID)"
-                          aria-label={
-                            fetchingAllStatus && fetchAllProgress
-                              ? `Fetch all Gmail status, ${fetchAllProgress.current} of ${fetchAllProgress.total}`
-                              : "Fetch Gmail closure status for all rows"
-                          }
-                        >
-                          <RefreshCw className={`h-4 w-4 sm:mr-2 ${fetchingAllStatus ? "animate-spin" : ""}`} />
-                          <span className="hidden min-[420px]:inline">
-                            {fetchingAllStatus && fetchAllProgress
-                              ? `Fetch all ${fetchAllProgress.current}/${fetchAllProgress.total}`
-                              : "Fetch all (Gmail)"}
-                          </span>
-                          <span className="min-[420px]:hidden">Fetch all</span>
-                        </Button>
-                      </div>
-
-                      <div className="hidden sm:block h-8 w-px bg-border shrink-0 self-center" aria-hidden />
-
-                      <div
-                        className="flex flex-wrap items-center gap-2 rounded-lg border border-border/60 bg-muted/30 px-2 py-1.5"
-                        role="group"
-                        aria-label="Export"
-                      >
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={handleDownloadXlsx}
-                          disabled={!csvForTable?.rows.length}
-                          className="shrink-0 h-9"
-                          title="Download current table with your status and closure updates"
-                          aria-label="Download current table as Excel"
-                        >
-                          <Download className="h-4 w-4 sm:mr-2" />
-                          <span className="hidden sm:inline">Download .xlsx</span>
-                          <span className="sm:hidden">Sheet</span>
-                        </Button>
-                        <Button
-                          variant="secondary"
-                          size="sm"
-                          onClick={handleDownloadConsolidatedXlsx}
-                          disabled={loading || emailsWithCsvDisplay.length === 0}
-                          className="shrink-0 h-9"
-                          title="One .xlsx: all loaded FY weekly CSV rows in a single sheet, plus report date and Gmail message id per row"
-                          aria-label="Download FY consolidated Excel workbook"
-                        >
-                          <Download className="h-4 w-4 sm:mr-2" />
-                          <span className="hidden lg:inline">FY consolidated .xlsx</span>
-                          <span className="hidden sm:inline lg:hidden">FY .xlsx</span>
-                          <span className="sm:hidden">FY</span>
-                        </Button>
-                      </div>
-
-                      <div className="hidden md:block h-8 w-px bg-border shrink-0 self-center" aria-hidden />
-
-                      <div
-                        className="flex flex-wrap items-center gap-2 rounded-lg border border-border/60 bg-muted/30 px-2 py-1.5"
-                        role="group"
-                        aria-label="Fetch by calendar date"
-                      >
-                        <span className="text-xs font-medium text-muted-foreground whitespace-nowrap">Fetch date</span>
+                      {fetchScope === "date" && (
                         <input
                           type="date"
                           className="h-9 rounded-md border border-input bg-background px-2 text-sm w-[9rem] shrink-0"
@@ -1219,19 +1556,47 @@ export default function WeeklyReports() {
                           value={fetchDate}
                           onChange={(e) => setFetchDate(e.target.value)}
                         />
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={handleFetchThisDate}
-                          disabled={loading}
-                          className="shrink-0 h-9"
-                          aria-label="Fetch weekly report for selected calendar date"
-                        >
-                          <RefreshCw className={`h-3.5 w-3.5 sm:mr-1.5 ${loading ? "animate-spin" : ""}`} />
-                          <span className="hidden sm:inline">Fetch this date</span>
-                          <span className="sm:hidden">Go</span>
-                        </Button>
-                      </div>
+                      )}
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={handleFetchSelectedScope}
+                        disabled={loading}
+                        className="shrink-0 h-9"
+                      >
+                        <RefreshCw className={`h-4 w-4 sm:mr-2 ${loading ? "animate-spin" : ""}`} />
+                        {loading ? "Fetching..." : "Fetch data"}
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={handleDownloadXlsx}
+                        disabled={!csvForTable?.rows.length}
+                        className="shrink-0 h-9"
+                        title="Download current alert table as Excel"
+                      >
+                        <Download className="h-4 w-4 sm:mr-2" />
+                        <span className="hidden sm:inline">Download alerts .xlsx</span>
+                        <span className="sm:hidden">Download</span>
+                      </Button>
+                    </div>
+                    <div className="xl:ml-auto">
+                      <ToggleGroup
+                        type="single"
+                        value={yearlySection}
+                        onValueChange={(v) => v && setYearlySection(v as "reports" | "analysis")}
+                        variant="outline"
+                        className="justify-start"
+                      >
+                        <ToggleGroupItem value="reports" className="gap-1.5">
+                          <LayoutGrid className="h-4 w-4" />
+                          Alerts
+                        </ToggleGroupItem>
+                        <ToggleGroupItem value="analysis" className="gap-1.5">
+                          <BarChart3 className="h-4 w-4" />
+                          Trends
+                        </ToggleGroupItem>
+                      </ToggleGroup>
                     </div>
                   </div>
                 </div>
@@ -1293,58 +1658,41 @@ export default function WeeklyReports() {
                   <ChevronRight className="h-4 w-4" />
                 </Button>
               </div>
-                <Button variant="outline" size="sm" onClick={refetch} disabled={loading} className="shrink-0 h-9">
-                <RefreshCw className={`h-4 w-4 mr-2 ${loading ? "animate-spin" : ""}`} />
-                Refresh
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={handleFetchAllLatestStatus}
-                disabled={loading || fetchingAllStatus || !csvForTable?.rows.length}
-                  className="shrink-0 h-9"
-                title="Fetch Gmail closure status for every row (Servicenow / Incident ID)"
-              >
-                <RefreshCw className={`h-4 w-4 mr-2 ${fetchingAllStatus ? "animate-spin" : ""}`} />
-                {fetchingAllStatus && fetchAllProgress
-                  ? `Fetch all ${fetchAllProgress.current}/${fetchAllProgress.total}`
-                  : "Fetch all (Gmail)"}
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={handleDownloadXlsx}
-                disabled={!csvForTable?.rows.length}
-                  className="shrink-0 h-9"
-                title="Download current table with your status and closure updates"
-              >
-                <Download className="h-4 w-4 mr-2" />
-                Download .xlsx
-              </Button>
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  onClick={handleDownloadConsolidatedXlsx}
-                  disabled={loading || emailsWithCsvDisplay.length === 0}
-                  className="shrink-0 h-9"
-                  title="One .xlsx: every loaded weekly CSV for this month in a single sheet"
-                >
-                  <Download className="h-4 w-4 sm:mr-2" />
-                  <span className="hidden sm:inline">Consolidated .xlsx</span>
+              <div className="flex flex-wrap items-center gap-2 rounded-lg border border-border/60 bg-muted/30 px-2 py-1.5">
+                <span className="text-xs font-medium text-muted-foreground whitespace-nowrap">Fetch</span>
+                <Select value={fetchScope} onValueChange={(v) => setFetchScope(v as "date" | "range")}>
+                  <SelectTrigger className="h-9 w-[11rem] bg-background">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="date">Week data</SelectItem>
+                    <SelectItem value="range">Monthly data</SelectItem>
+                  </SelectContent>
+                </Select>
+                {fetchScope === "date" && (
+                  <input
+                    type="date"
+                    className="h-9 rounded-md border border-input bg-background px-2 text-sm w-[8.5rem]"
+                    min={fetchDateMin}
+                    max={fetchDateMax}
+                    value={fetchDate}
+                    onChange={(e) => setFetchDate(e.target.value)}
+                  />
+                )}
+                <Button variant="outline" size="sm" onClick={handleFetchSelectedScope} disabled={loading} className="shrink-0 h-9">
+                  <RefreshCw className={`h-4 w-4 mr-2 ${loading ? "animate-spin" : ""}`} />
+                  {loading ? "Fetching..." : "Fetch data"}
                 </Button>
-                <div className="flex flex-wrap items-center gap-2 shrink-0 border-l border-border pl-3">
-                <span className="text-sm text-muted-foreground hidden sm:inline">Fetch date</span>
-                <input
-                  type="date"
-                  className="h-9 rounded-md border border-input bg-background px-2 text-sm w-[8.5rem]"
-                  min={fetchDateMin}
-                  max={fetchDateMax}
-                  value={fetchDate}
-                  onChange={(e) => setFetchDate(e.target.value)}
-                />
-                  <Button variant="outline" size="sm" onClick={handleFetchThisDate} disabled={loading} className="shrink-0 h-9">
-                  <RefreshCw className={`h-3.5 w-3.5 mr-1.5 ${loading ? "animate-spin" : ""}`} />
-                  Fetch this date
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleDownloadXlsx}
+                  disabled={!csvForTable?.rows.length}
+                  className="shrink-0 h-9"
+                  title="Download current alert table as Excel"
+                >
+                  <Download className="h-4 w-4 mr-2" />
+                  Download alerts .xlsx
                 </Button>
               </div>
                 <div className="min-w-0 flex-1 basis-[min(100%,14rem)]">
@@ -1402,188 +1750,249 @@ export default function WeeklyReports() {
           )}
 
           {isYearlyView ? (
-            <Tabs defaultValue="reports" className="flex flex-1 flex-col min-h-0 min-w-0">
-              <div className="shrink-0 border-b border-border bg-muted/20 px-6 py-3">
-                <TabsList className="h-auto w-full flex-wrap justify-start gap-1 rounded-xl bg-muted/60 p-1 sm:w-auto">
-                  <TabsTrigger
-                    value="reports"
-                    className="gap-1.5 rounded-lg px-3 py-2 text-sm data-[state=active]:bg-background data-[state=active]:shadow-sm"
-                  >
-                    <LayoutGrid className="h-4 w-4 opacity-70" />
-                    Reports &amp; table
-                  </TabsTrigger>
-                  <TabsTrigger
-                    value="analysis"
-                    className="gap-1.5 rounded-lg px-3 py-2 text-sm data-[state=active]:bg-background data-[state=active]:shadow-sm"
-                  >
-                    <BarChart3 className="h-4 w-4 opacity-70" />
-                    Trends
-                  </TabsTrigger>
-                  <TabsTrigger
-                    value="coverage"
-                    className="gap-1.5 rounded-lg px-3 py-2 text-sm data-[state=active]:bg-background data-[state=active]:shadow-sm"
-                  >
-                    <Radar className="h-4 w-4 opacity-70" />
-                    Fetch coverage
-                  </TabsTrigger>
-                </TabsList>
-              </div>
+            <Tabs value={yearlySection} className="flex flex-1 flex-col min-h-0 min-w-0">
               <TabsContent
                 value="reports"
                 className="flex flex-1 flex-col min-h-0 mt-0 overflow-hidden focus-visible:outline-none data-[state=inactive]:hidden"
               >
-                {!loading && emailsWithCsvDisplay.length > 0 && (
+                {((isYearlyView && !reportAlertsLoading && (reportAlertsCsv?.rows?.length ?? 0) > 0) ||
+                  (!isYearlyView && !loading && emailsWithCsvDisplay.length > 0)) && (
                   <div className="shrink-0 border-b border-border bg-background px-6 py-4 shadow-sm space-y-4">
-                    <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
-                      <span className="text-sm font-medium text-muted-foreground shrink-0">Report date</span>
-                      <div className="flex items-center gap-0.5 rounded-lg border border-input bg-background min-w-0">
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          className="h-9 w-9 shrink-0"
-                          disabled={emailsWithCsvDisplay.length <= 1 || safeReportIndex <= 0}
-                          onClick={() => setSelectedReportIndex(Math.max(0, safeReportIndex - 1))}
-                          title="Previous date"
-                        >
-                          <ChevronLeft className="h-4 w-4" />
-                        </Button>
+                    {isYearlyView ? (
+                      <div className="flex flex-wrap items-center gap-2 rounded-lg border border-border/70 bg-muted/20 px-3 py-2">
+                        <span className="text-xs font-medium text-muted-foreground">Alert created</span>
                         <Select
-                          value={selectedEmail?.id ?? ""}
-                          onValueChange={(id) => {
-                            const idx = emailsWithCsvDisplay.findIndex((e) => e.id === id);
-                            if (idx >= 0) setSelectedReportIndex(idx);
-                          }}
+                          value={yearlyCreationScope}
+                          onValueChange={(v) => setYearlyCreationScope(v as "date" | "range")}
                         >
-                          <SelectTrigger className="h-9 min-w-[12rem] max-w-[min(100vw-8rem,28rem)] border-0 bg-transparent shadow-none focus:ring-0 text-sm">
-                            <SelectValue placeholder="Select date" />
+                          <SelectTrigger className="h-9 w-[7.5rem] bg-background">
+                            <SelectValue />
                           </SelectTrigger>
                           <SelectContent>
-                            {emailsWithCsvDisplay.map((email) => (
-                              <SelectItem key={email.id} value={email.id}>
-                                {formatReportDate(email)}
-                              </SelectItem>
-                            ))}
+                            <SelectItem value="date">Single day</SelectItem>
+                            <SelectItem value="range">Date range</SelectItem>
                           </SelectContent>
                         </Select>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          className="h-9 w-9 shrink-0"
-                          disabled={emailsWithCsvDisplay.length <= 1 || safeReportIndex >= emailsWithCsvDisplay.length - 1}
-                          onClick={() => setSelectedReportIndex(Math.min(emailsWithCsvDisplay.length - 1, safeReportIndex + 1))}
-                          title="Next date"
-                        >
-                          <ChevronRight className="h-4 w-4" />
-                        </Button>
+                        <Popover open={yearlyCreationCalendarOpen} onOpenChange={setYearlyCreationCalendarOpen}>
+                          <PopoverTrigger asChild>
+                            <Button
+                              variant="outline"
+                              className="h-9 min-w-[14rem] justify-start gap-2 px-3 font-normal text-sm"
+                              title="Filter by alert creation date"
+                            >
+                              <CalendarIcon className="h-4 w-4 shrink-0 opacity-70" />
+                              <span className="truncate">
+                                {yearlyCreationScope === "date"
+                                  ? yearlyCreationDate
+                                  : yearlyCreationRange.from
+                                    ? `${toYYYYMMDD(yearlyCreationRange.from)}${yearlyCreationRange.to ? ` – ${toYYYYMMDD(yearlyCreationRange.to)}` : ""}`
+                                    : "Select range"}
+                              </span>
+                            </Button>
+                          </PopoverTrigger>
+                          <PopoverContent className="w-auto p-0" align="start">
+                            {yearlyCreationScope === "date" ? (
+                              <DatePickerCalendar
+                                mode="single"
+                                selected={parseISODateLocal(yearlyCreationDate)}
+                                onSelect={(date) => {
+                                  if (!date) return;
+                                  setYearlyCreationDate(toYYYYMMDD(date));
+                                  setYearlyCreationCalendarOpen(false);
+                                }}
+                                fromDate={parseISODateLocal(activeYearlyFy.afterDate)}
+                                toDate={parseISODateLocal(fetchDateMax)}
+                                disabled={(date) => {
+                                  const key = toYYYYMMDD(date);
+                                  return key < activeYearlyFy.afterDate || key > fetchDateMax;
+                                }}
+                                initialFocus
+                              />
+                            ) : (
+                              <DatePickerCalendar
+                                mode="range"
+                                selected={{ from: yearlyCreationRange.from, to: yearlyCreationRange.to }}
+                                onSelect={(range) => {
+                                  setYearlyCreationRange({ from: range?.from, to: range?.to });
+                                  if (range?.from && range?.to) setYearlyCreationCalendarOpen(false);
+                                }}
+                                fromDate={parseISODateLocal(activeYearlyFy.afterDate)}
+                                toDate={parseISODateLocal(fetchDateMax)}
+                                disabled={(date) => {
+                                  const key = toYYYYMMDD(date);
+                                  return key < activeYearlyFy.afterDate || key > fetchDateMax;
+                                }}
+                                initialFocus
+                              />
+                            )}
+                          </PopoverContent>
+                        </Popover>
+                        {reportAlertsSummary ? (
+                          <>
+                            {reportAlertsSummary.usedDailySource ? (
+                              <Badge variant="secondary" className="font-normal">
+                                Daily + weekly
+                              </Badge>
+                            ) : (
+                              <Badge variant="outline" className="font-normal">
+                                Weekly archive
+                              </Badge>
+                            )}
+                            <span className="text-xs text-muted-foreground tabular-nums">
+                              {reportAlertsSummary.uniqueAlerts} in FY
+                            </span>
+                          </>
+                        ) : null}
                       </div>
-                    </div>
-                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-                      <Card className="border border-border/80 shadow-sm bg-primary/5 rounded-xl">
-                        <CardContent className="p-4 sm:p-5">
-                          <div className="flex items-center gap-2 mb-3">
-                            <Calendar className="h-5 w-5 text-primary shrink-0" />
-                            <p className="text-xs font-semibold text-primary uppercase tracking-wide">FY total (all loaded reports)</p>
-                          </div>
-                          <p className="text-xl font-bold text-foreground mb-4 tabular-nums">{monthStats.total} alerts</p>
-                          <dl className="grid grid-cols-1 sm:grid-cols-2 gap-x-8 gap-y-3 text-sm">
-                            {[
-                              ["Open", monthStats.open],
-                              ["Closed", monthStats.closed],
-                              ["Merged", monthStats.merged],
-                              ["Pending", monthStats.pending],
-                              ["In progress", monthStats.inProgress],
-                              ["Incident auto closed", monthStats.incidentAutoClosed],
-                            ].map(([label, val]) => (
-                              <div key={label} className="flex items-baseline justify-between gap-6 min-w-0">
-                                <dt className="text-muted-foreground">{label}</dt>
-                                <dd className="font-semibold tabular-nums text-foreground text-right">{val}</dd>
-                              </div>
-                            ))}
-                          </dl>
-                        </CardContent>
-                      </Card>
-                      <Card className="border border-border/80 shadow-sm bg-blue-500/5 rounded-xl">
-                        <CardContent className="p-4 sm:p-5">
-                          <div className="flex items-center gap-2 mb-2">
-                            <FileText className="h-5 w-5 text-blue-600 dark:text-blue-400 shrink-0" />
-                            <p className="text-xs font-semibold text-blue-700 dark:text-blue-300 uppercase tracking-wide">This date</p>
-                          </div>
-                          <p className="text-xs text-muted-foreground mb-3 truncate">{selectedEmail ? formatReportDate(selectedEmail) : "—"}</p>
-                          <p className="text-xl font-bold text-foreground mb-4 tabular-nums">{selectedDateStats.total} alerts</p>
-                          <dl className="grid grid-cols-1 sm:grid-cols-2 gap-x-8 gap-y-3 text-sm">
-                            {[
-                              ["Open", selectedDateStats.open],
-                              ["Closed", selectedDateStats.closed],
-                              ["Merged", selectedDateStats.merged],
-                              ["Pending", selectedDateStats.pending],
-                              ["In progress", selectedDateStats.inProgress],
-                              ["Incident auto closed", selectedDateStats.incidentAutoClosed],
-                            ].map(([label, val]) => (
-                              <div key={label} className="flex items-baseline justify-between gap-6 min-w-0">
-                                <dt className="text-muted-foreground">{label}</dt>
-                                <dd className="font-semibold tabular-nums text-foreground text-right">{val}</dd>
-                              </div>
-                            ))}
-                          </dl>
-                        </CardContent>
-                      </Card>
+                    ) : (
+                      <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+                        <span className="text-sm font-medium text-muted-foreground shrink-0">Report date</span>
+                        <div className="flex items-center gap-0.5 rounded-lg border border-input bg-background min-w-0">
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="h-9 w-9 shrink-0"
+                            disabled={emailsWithCsvDisplay.length <= 1 || safeReportIndex <= 0}
+                            onClick={() => setSelectedReportIndex(Math.max(0, safeReportIndex - 1))}
+                            title="Previous date"
+                          >
+                            <ChevronLeft className="h-4 w-4" />
+                          </Button>
+                          <Select
+                            value={selectedEmail?.id ?? ""}
+                            onValueChange={(id) => {
+                              const idx = emailsWithCsvDisplay.findIndex((e) => e.id === id);
+                              if (idx >= 0) setSelectedReportIndex(idx);
+                            }}
+                          >
+                            <SelectTrigger className="h-9 min-w-[12rem] max-w-[min(100vw-8rem,28rem)] border-0 bg-transparent shadow-none focus:ring-0 text-sm">
+                              <SelectValue placeholder="Select date" />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {emailsWithCsvDisplay.map((email) => (
+                                <SelectItem key={email.id} value={email.id}>
+                                  {formatReportDate(email)}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="h-9 w-9 shrink-0"
+                            disabled={emailsWithCsvDisplay.length <= 1 || safeReportIndex >= emailsWithCsvDisplay.length - 1}
+                            onClick={() => setSelectedReportIndex(Math.min(emailsWithCsvDisplay.length - 1, safeReportIndex + 1))}
+                            title="Next date"
+                          >
+                            <ChevronRight className="h-4 w-4" />
+                          </Button>
+                        </div>
+                      </div>
+                    )}
+                    <div className="grid grid-cols-1 xl:grid-cols-2 gap-3 w-full">
+                      <ReportStatusSummaryCard
+                        variant="primary"
+                        title="FY total"
+                        total={monthStats.total}
+                        counts={monthStats}
+                      />
+                      <ReportStatusSummaryCard
+                        variant="blue"
+                        title="Selected date"
+                        subtitle={
+                          isYearlyView
+                            ? yearlyCreationScope === "date"
+                              ? yearlyCreationDate
+                              : yearlyCreationRange.from
+                                ? `${toYYYYMMDD(yearlyCreationRange.from)}${yearlyCreationRange.to ? ` – ${toYYYYMMDD(yearlyCreationRange.to)}` : ""}`
+                                : "—"
+                            : selectedEmail
+                              ? formatReportDate(selectedEmail)
+                              : "—"
+                        }
+                        total={selectedDateStats.total}
+                        counts={selectedDateStats}
+                      />
                     </div>
                   </div>
                 )}
                 <div className="min-h-0 min-w-0 flex-1 overflow-auto">
-                  {error && (
+                  {(error || reportAlertsError) && (
                     <div className="mx-6 mt-4 rounded-lg border border-destructive/50 bg-destructive/10 px-4 py-3 text-sm text-destructive flex items-center justify-between gap-4">
-                      <span>{error}</span>
-                      {(error.toLowerCase().includes("reconnect") || error.toLowerCase().includes("expired")) && (
+                      <span>{reportAlertsError ?? error}</span>
+                      {((reportAlertsError ?? error ?? "")
+                        .toLowerCase()
+                        .includes("reconnect") ||
+                        (reportAlertsError ?? error ?? "").toLowerCase().includes("expired")) && (
                         <Button variant="outline" size="sm" onClick={() => { window.location.href = `${API_BASE_URL}/auth/google`; }}>
                           Reconnect Gmail
                         </Button>
                       )}
                     </div>
                   )}
-                  {!loading && emailsWithCsvDisplay.length > 0 && csvForTable && selectedEmail && (
+                  {((isYearlyView &&
+                    !reportAlertsLoading &&
+                    csvForTable &&
+                    csvForTable.rows.length > 0) ||
+                    (!isYearlyView &&
+                      !loading &&
+                      emailsWithCsvDisplay.length > 0 &&
+                      csvForTable &&
+                      selectedEmail)) && (
                     <section className="p-6">
-                      <Card key={selectedEmail.id} className="overflow-hidden">
+                      <Card key={isYearlyView ? "yearly-unified-alerts" : selectedEmail!.id} className="overflow-hidden">
                         <CardHeader className="py-3 px-4 bg-muted/30 border-b">
                           <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                             <div className="min-w-0">
                               <h3 className="text-base font-semibold text-foreground">
-                                Report — {formatReportDate(selectedEmail)}
+                                {isYearlyView
+                                  ? `Alerts — ${yearlyCreationScope === "date" ? yearlyCreationDate : "selected range"}`
+                                  : `Report — ${formatReportDate(selectedEmail!)}`}
                               </h3>
                               {csvForTable.filename && (
                                 <p className="text-xs text-muted-foreground mt-1">
-                                  {csvForTable.filename} • {csvForTable.rows?.length ?? 0} rows • status and closures are saved in
-                                  this browser
+                                  {csvForTable.filename} • {csvForTable.rows?.length ?? 0} rows • from daily & weekly PB reports
                                 </p>
                               )}
                             </div>
-                            <div className="flex flex-wrap items-center gap-2 shrink-0">
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                disabled={fetchingAllStatus || !csvForTable?.rows.length}
-                                onClick={() => void handleFetchAllLatestStatus()}
-                                title="Fetch current status, closure date, and closure comments from Gmail for every row (ServiceNow / Incident ID)"
-                                aria-label="Fetch all rows: status, closure date, and closure comments from Gmail"
-                              >
-                                {fetchingAllStatus && fetchAllProgress
-                                  ? `Fetching… ${fetchAllProgress.current}/${fetchAllProgress.total}`
-                                  : "Fetch all (this report)"}
-                              </Button>
-                            </div>
+                            {!isYearlyView && selectedEmail && (
+                              <FetchAllReportButtons
+                                canResume={fetchAllResume.canResume}
+                                resumeFromRow={fetchAllResume.resumeFromIndex + 1}
+                                fetching={fetchingAllStatus}
+                                progress={fetchAllProgress}
+                                disabled={!csvForTable?.rows.length}
+                                onResume={() => void handleFetchAllLatestStatus(false)}
+                                onStartFromBeginning={() => void handleFetchAllLatestStatus(true)}
+                              />
+                            )}
                           </div>
                         </CardHeader>
                         <CardContent className="p-4">
                           <CsvDataTable
                             csv={csvForTable}
-                            onRowClick={handleAlertRowClick}
-                            statusOverrides={statusOverrides}
-                            closureCommentsOverrides={closureCommentsOverrides}
-                            closureDateOverrides={closureDateOverrides}
-                            getRowKey={getRowKey(selectedEmail.id)}
-                            onStatusChange={(row, newStatus) => handleStatusChange(row, newStatus, selectedEmail.id)}
-                            onClosureCommentsChange={(row, newValue) => handleClosureCommentsChange(row, newValue, selectedEmail.id)}
-                            onClosureDateChange={(row, newValue) => handleClosureDateChange(row, newValue, selectedEmail.id)}
+                            onRowClick={isYearlyView ? undefined : handleAlertRowClick}
+                            statusOverrides={isYearlyView ? reportStatusOverrides : statusOverrides}
+                            closureCommentsOverrides={
+                              isYearlyView ? reportClosureCommentsOverrides : closureCommentsOverrides
+                            }
+                            closureDateOverrides={isYearlyView ? reportClosureDateOverrides : closureDateOverrides}
+                            getRowKey={isYearlyView ? getUnifiedRowKey() : getRowKey(selectedEmail!.id)}
+                            onStatusChange={(row, newStatus) =>
+                              isYearlyView
+                                ? handleReportStatusChange(row, newStatus)
+                                : handleStatusChange(row, newStatus, selectedEmail!.id)
+                            }
+                            onClosureCommentsChange={(row, newValue) =>
+                              isYearlyView
+                                ? handleReportClosureCommentsChange(row, newValue)
+                                : handleClosureCommentsChange(row, newValue, selectedEmail!.id)
+                            }
+                            onClosureDateChange={(row, newValue) =>
+                              isYearlyView
+                                ? handleReportClosureDateChange(row, newValue)
+                                : handleClosureDateChange(row, newValue, selectedEmail!.id)
+                            }
                           />
                         </CardContent>
                       </Card>
@@ -1592,28 +2001,46 @@ export default function WeeklyReports() {
                   {trailLoading && (
                     <p className="px-6 text-sm text-muted-foreground">Searching for mail trail…</p>
                   )}
-                  {isHydratingFromCache && emails.length === 0 && (
+                  {reportAlertsLoading && (
                     <div className="mx-6 my-4 rounded-lg border border-border bg-muted/30 px-4 py-6 text-sm text-muted-foreground flex items-center gap-3">
                       <RefreshCw className="h-4 w-4 animate-spin shrink-0" />
-                      <span>Loading weekly reports for this FY from the server…</span>
+                      <span>Loading PB report alerts for {activeYearlyFy.rangeLabel}…</span>
                     </div>
                   )}
-                  {!loading && isYearlyView && emailsWithCsv.length > 0 && emailsWithCsvDisplay.length === 0 && (
-                    <p className="px-6 py-4 text-sm text-muted-foreground">
-                      Every row in the loaded weekly CSVs was filtered out: alert <strong>creation</strong> date is outside{" "}
-                      <strong>{activeYearlyFy.rangeLabel}</strong> (or the creation column could not be read). Check column names
-                      like Created / Creation Date, or open the monthly view for the full file.
-                    </p>
+                  {isHydratingFromCache && emails.length === 0 && !reportAlertsLoading && (
+                    <div className="mx-6 my-4 rounded-lg border border-border bg-muted/30 px-4 py-6 text-sm text-muted-foreground flex items-center gap-3">
+                      <RefreshCw className="h-4 w-4 animate-spin shrink-0" />
+                      <span>Syncing weekly reports for trends (optional)…</span>
+                    </div>
                   )}
-                  {!loading && emails.length > 0 && emailsWithCsv.length === 0 && (
+                  {!reportAlertsLoading &&
+                    isYearlyView &&
+                    reportAlertsCsv &&
+                    reportAlertsCsv.rows.length > 0 &&
+                    filteredYearlyReportRows.length === 0 && (
+                      <p className="px-6 py-4 text-sm text-muted-foreground">
+                        No alerts with <strong>creation date</strong> on the selected day or range. Try another date or widen the
+                        range.
+                      </p>
+                    )}
+                  {!reportAlertsLoading &&
+                    !reportAlertsError &&
+                    isYearlyView &&
+                    (!reportAlertsCsv || reportAlertsCsv.rows.length === 0) && (
+                      <p className="px-6 py-4 text-sm text-muted-foreground">
+                        No PB report alerts cached for <strong>{activeYearlyFy.rangeLabel}</strong>. Use{" "}
+                        <strong>Fetch data</strong> to sync weekly reports, open <strong>Daily Alerts</strong> to sync daily
+                        reports, then return here.
+                      </p>
+                    )}
+                  {!loading && emails.length > 0 && emailsWithCsv.length === 0 && !isYearlyView && (
                     <p className="px-6 py-4 text-sm text-muted-foreground">
                       No CSV attachments found in the loaded emails. Ensure PB Weekly report emails include a .csv file.
                     </p>
                   )}
-                  {!loading && !isHydratingFromCache && emails.length === 0 && !error && (
+                  {!loading && !isHydratingFromCache && emails.length === 0 && !error && !isYearlyView && (
                     <p className="px-6 py-4 text-sm text-muted-foreground">
-                      Click <strong>Refresh</strong> to load all PB Weekly reports for <strong>{activeYearlyFy.rangeLabel}</strong>{" "}
-                      (up to {YEARLY_MAX_RESULTS} messages). First load may take a short while.
+                      Click <strong>Fetch data</strong> to load PB Weekly reports for this month.
                     </p>
                   )}
                 </div>
@@ -1623,14 +2050,6 @@ export default function WeeklyReports() {
                 className="flex-1 min-h-0 overflow-auto mt-0 px-6 py-4 focus-visible:outline-none data-[state=inactive]:hidden"
               >
                 <YearlyFyTrendSection data={yearlyMonthTrend} fyLabel={activeYearlyFy.label} />
-              </TabsContent>
-              <TabsContent
-                value="coverage"
-                className="flex-1 min-h-0 overflow-auto mt-0 px-6 py-4 focus-visible:outline-none data-[state=inactive]:hidden"
-              >
-                {yearlyCoverage ? (
-                  <YearlyFyCoverageSection {...yearlyCoverage} fyLabel={activeYearlyFy.label} />
-                ) : null}
               </TabsContent>
             </Tabs>
           ) : (
@@ -1680,54 +2099,20 @@ export default function WeeklyReports() {
                   </Button>
                 </div>
               </div>
-              <div className="grid grid-cols-1 lg:grid-cols-2 gap-2">
-                <Card className="border border-border shadow-sm bg-primary/5">
-                  <CardContent className="p-2">
-                    <div className="flex items-center gap-1.5 mb-1">
-                      <Calendar className="h-4 w-4 text-primary shrink-0" />
-                      <p className="text-xs font-semibold text-primary uppercase tracking-wide">Month data</p>
-                    </div>
-                    <p className="text-lg font-bold text-foreground mb-1">Total: {monthStats.total} alerts</p>
-                        <div className="grid grid-cols-2 sm:grid-cols-3 gap-x-2 gap-y-0.5 text-xs">
-                      <span className="text-muted-foreground">Open:</span>
-                      <span className="font-medium text-foreground">{monthStats.open}</span>
-                      <span className="text-muted-foreground">Closed:</span>
-                      <span className="font-medium text-foreground">{monthStats.closed}</span>
-                          <span className="text-muted-foreground">Merged:</span>
-                          <span className="font-medium text-foreground">{monthStats.merged}</span>
-                      <span className="text-muted-foreground">Pending:</span>
-                          <span className="font-medium text-foreground">{monthStats.pending}</span>
-                          <span className="text-muted-foreground">In progress:</span>
-                      <span className="font-medium text-foreground">{monthStats.inProgress}</span>
-                      <span className="text-muted-foreground">Incident Auto Closed:</span>
-                      <span className="font-medium text-foreground">{monthStats.incidentAutoClosed}</span>
-                    </div>
-                  </CardContent>
-                </Card>
-                <Card className="border border-border shadow-sm bg-blue-500/5">
-                  <CardContent className="p-2">
-                    <div className="flex items-center gap-1.5 mb-1">
-                      <FileText className="h-4 w-4 text-blue-600 dark:text-blue-400 shrink-0" />
-                      <p className="text-xs font-semibold text-blue-700 dark:text-blue-300 uppercase tracking-wide">This date</p>
-                    </div>
-                    <p className="text-[10px] text-muted-foreground truncate mb-0.5">{selectedEmail ? formatReportDate(selectedEmail) : "—"}</p>
-                    <p className="text-lg font-bold text-foreground mb-1">Total: {selectedDateStats.total} alerts</p>
-                        <div className="grid grid-cols-2 sm:grid-cols-3 gap-x-2 gap-y-0.5 text-xs">
-                      <span className="text-muted-foreground">Open:</span>
-                      <span className="font-medium text-foreground">{selectedDateStats.open}</span>
-                      <span className="text-muted-foreground">Closed:</span>
-                      <span className="font-medium text-foreground">{selectedDateStats.closed}</span>
-                          <span className="text-muted-foreground">Merged:</span>
-                          <span className="font-medium text-foreground">{selectedDateStats.merged}</span>
-                      <span className="text-muted-foreground">Pending:</span>
-                          <span className="font-medium text-foreground">{selectedDateStats.pending}</span>
-                          <span className="text-muted-foreground">In progress:</span>
-                      <span className="font-medium text-foreground">{selectedDateStats.inProgress}</span>
-                      <span className="text-muted-foreground">Incident Auto Closed:</span>
-                      <span className="font-medium text-foreground">{selectedDateStats.incidentAutoClosed}</span>
-                    </div>
-                  </CardContent>
-                </Card>
+              <div className="grid grid-cols-1 xl:grid-cols-2 gap-3 w-full">
+                <ReportStatusSummaryCard
+                  variant="primary"
+                  title="Month data"
+                  total={monthStats.total}
+                  counts={monthStats}
+                />
+                <ReportStatusSummaryCard
+                  variant="blue"
+                  title="Report date"
+                  subtitle={selectedEmail ? formatReportDate(selectedEmail) : "—"}
+                  total={selectedDateStats.total}
+                  counts={selectedDateStats}
+                />
               </div>
             </div>
           )}
@@ -1758,20 +2143,15 @@ export default function WeeklyReports() {
                       </p>
                     )}
                           </div>
-                          <div className="flex flex-wrap items-center gap-2 shrink-0">
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              disabled={fetchingAllStatus || !csvForTable?.rows.length}
-                              onClick={() => void handleFetchAllLatestStatus()}
-                              title="Fetch current status, closure date, and closure comments from Gmail for every row (ServiceNow / Incident ID)"
-                              aria-label="Fetch all rows: status, closure date, and closure comments from Gmail"
-                            >
-                              {fetchingAllStatus && fetchAllProgress
-                                ? `Fetching… ${fetchAllProgress.current}/${fetchAllProgress.total}`
-                                : "Fetch all (this report)"}
-                            </Button>
-                          </div>
+                          <FetchAllReportButtons
+                            canResume={fetchAllResume.canResume}
+                            resumeFromRow={fetchAllResume.resumeFromIndex + 1}
+                            fetching={fetchingAllStatus}
+                            progress={fetchAllProgress}
+                            disabled={!csvForTable?.rows.length}
+                            onResume={() => void handleFetchAllLatestStatus(false)}
+                            onStartFromBeginning={() => void handleFetchAllLatestStatus(true)}
+                          />
                         </div>
                   </CardHeader>
                   <CardContent className="p-4">

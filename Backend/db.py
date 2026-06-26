@@ -50,6 +50,26 @@ class Base(DeclarativeBase):
     """Common declarative base for all ORM models."""
 
 
+def _ensure_additive_columns() -> None:
+    """Apply lightweight additive migrations (SQLite ALTER TABLE)."""
+    if not DATABASE_URL.startswith("sqlite"):
+        return
+    from sqlalchemy import inspect, text
+
+    insp = inspect(engine)
+    if "daily_report_emails" not in insp.get_table_names():
+        return
+    cols = {c["name"] for c in insp.get_columns("daily_report_emails")}
+    if "report_date" not in cols:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "ALTER TABLE daily_report_emails "
+                    "ADD COLUMN report_date VARCHAR(10)"
+                )
+            )
+
+
 def init_db() -> None:
     """
     Create all tables if they don't exist. Safe to call repeatedly.
@@ -62,6 +82,7 @@ def init_db() -> None:
     from models import db_models  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
+    _ensure_additive_columns()
 
 
 @contextmanager

@@ -1,17 +1,43 @@
-import { useCallback, useState, useEffect } from "react";
+import { useCallback, useState, useEffect, useMemo, useRef } from "react";
 import { SidebarProvider, SidebarInset } from "@/components/ui/sidebar";
 import { SOCSidebar } from "@/components/SOCSidebar";
 import { ThemeToggle } from "@/components/ThemeToggle";
 import { NotificationsPanel } from "@/components/NotificationsPanel";
 import { Button } from "@/components/ui/button";
+import {
+    DropdownMenu,
+    DropdownMenuContent,
+    DropdownMenuItem,
+    DropdownMenuLabel,
+    DropdownMenuSeparator,
+    DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Progress } from "@/components/ui/progress";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Upload, Trash2, FileSpreadsheet, ChevronsLeft, ChevronLeft, ChevronRight, ChevronsRight } from "lucide-react";
+import { Upload, Trash2, FileSpreadsheet, ChevronsLeft, ChevronLeft, ChevronRight, ChevronsRight, Loader2, RefreshCw, ChevronDown } from "lucide-react";
 import { SiemDynamicUseCaseTable, type SiemDynamicRow } from "@/components/SiemDynamicUseCaseTable";
 import { SiemUseCase } from "@/types/siemUseCase";
 import Papa from "papaparse";
 import * as XLSX from "xlsx";
 import { useToast } from "@/hooks/use-toast";
+import {
+    getLastNMonthColumnLabels,
+    isMonthColumnHeader,
+    monthColumnGmailDateRange,
+    normalizeSheetMonthColumns,
+} from "@/lib/siemMonthColumns";
+import { findRuleNameColumn } from "@/lib/siemMasterRules";
+import {
+    postGmailSiemRuleLatestIncidentsResilient,
+    type SiemRuleLatestIncidentsRow,
+} from "@/api/gmail";
+import {
+    deleteSiemWorkbook,
+    getSiemWorkbook,
+    putSiemWorkbookResilient,
+    type SiemWorkbookSheetDto,
+} from "@/api/siemWorkbook";
 
 const STORAGE_KEY_V2 = "siemWorkbookV2";
 
@@ -23,15 +49,11 @@ export interface SiemWorkbookSheet {
 }
 
 function computeDefaultMonthColumns(): string[] {
-    const now = new Date();
-    const monthNames = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
-    const prev1 = (now.getMonth() - 1 + 12) % 12;
-    const prev2 = (now.getMonth() - 2 + 12) % 12;
-    const prev3 = (now.getMonth() - 3 + 12) % 12;
-    return [monthNames[prev3], monthNames[prev2], monthNames[prev1]];
+    return getLastNMonthColumnLabels(4);
+}
+
+function normalizeWorkbookSheets(sheets: SiemWorkbookSheet[]): SiemWorkbookSheet[] {
+    return sheets.map((s) => normalizeSheetMonthColumns(s));
 }
 
 /** Legacy upload format → dynamic sheet (fixed columns + month columns). */
@@ -123,6 +145,81 @@ function buildSheetFromObjects(name: string, data: Record<string, string>[]): Si
     return { name, columns, rows };
 }
 
+function clearLegacySiemBrowserStorage() {
+    try {
+        localStorage.removeItem(STORAGE_KEY_V2);
+        localStorage.removeItem("siemUseCases");
+        localStorage.removeItem("siemMonthColumns");
+    } catch {
+        /* ignore */
+    }
+}
+
+function readLegacyWorkbookFromBrowser(): { sheets: SiemWorkbookSheet[]; activeSheetIndex: number } | null {
+    try {
+        const savedV2 = localStorage.getItem(STORAGE_KEY_V2);
+        if (savedV2) {
+            const parsed = JSON.parse(savedV2) as { sheets?: unknown[]; activeSheetIndex?: number };
+            if (parsed?.sheets && Array.isArray(parsed.sheets) && parsed.sheets.length > 0) {
+                const migrated = normalizeWorkbookSheets(
+                    parsed.sheets.map(migrateSheetFromStorage)
+                );
+                const idx = typeof parsed.activeSheetIndex === "number" ? parsed.activeSheetIndex : 0;
+                return {
+                    sheets: migrated,
+                    activeSheetIndex: Math.min(Math.max(0, idx), migrated.length - 1),
+                };
+            }
+        }
+        const savedUseCases = localStorage.getItem("siemUseCases");
+        const savedMonthCols = localStorage.getItem("siemMonthColumns");
+        if (savedUseCases) {
+            const parsedUseCases = JSON.parse(savedUseCases) as SiemUseCase[];
+            const parsedMonthCols = savedMonthCols
+                ? (JSON.parse(savedMonthCols) as string[])
+                : computeDefaultMonthColumns();
+            if (parsedUseCases.length > 0) {
+                const sheet = legacyUseCasesToDynamic("Sheet1", parsedUseCases, parsedMonthCols);
+                return { sheets: normalizeWorkbookSheets([sheet]), activeSheetIndex: 0 };
+            }
+        }
+    } catch {
+        /* ignore */
+    }
+    return null;
+}
+
+/** Merge Gmail incident fetch results into workbook state (pure — safe to save immediately). */
+function mergeIncidentResultsIntoSheets(
+    sheets: SiemWorkbookSheet[],
+    sheetIndex: number,
+    results: SiemRuleLatestIncidentsRow[]
+): SiemWorkbookSheet[] {
+    if (!results.length) return sheets;
+    return sheets.map((sheet, idx) => {
+        if (idx !== sheetIndex) return sheet;
+        const byRowId = new Map(results.filter((r) => r.row_id).map((r) => [r.row_id as string, r]));
+        const byRuleLower = new Map(results.map((r) => [r.rule_name.trim().toLowerCase(), r]));
+        const ruleCol = findRuleNameColumn(sheet.columns);
+        return {
+            ...sheet,
+            rows: sheet.rows.map((row) => {
+                const hit =
+                    byRowId.get(row.id) ??
+                    (ruleCol ? byRuleLower.get((row[ruleCol] ?? "").trim().toLowerCase()) : undefined);
+                if (!hit) return row;
+                const next = { ...row };
+                for (const [label, cell] of Object.entries(hit.by_month)) {
+                    const mapped =
+                        cell.mapped_id ?? cell.latest_incident_id ?? cell.latest_case_id ?? null;
+                    next[label] = mapped ?? "NA";
+                }
+                return next;
+            }),
+        };
+    });
+}
+
 function migrateSheetFromStorage(s: unknown): SiemWorkbookSheet {
     if (!s || typeof s !== "object") return { name: "Sheet", columns: [], rows: [] };
     const o = s as Record<string, unknown>;
@@ -145,55 +242,156 @@ export default function SiemUseCases() {
     const [sheets, setSheets] = useState<SiemWorkbookSheet[]>([]);
     const [activeSheetIndex, setActiveSheetIndex] = useState(0);
     const [isDragging, setIsDragging] = useState(false);
+    const [fetchingIncidents, setFetchingIncidents] = useState(false);
+    const [fetchingRowId, setFetchingRowId] = useState<string | null>(null);
+    const [fetchProgress, setFetchProgress] = useState<{
+        done: number;
+        total: number;
+        monthLabel?: string;
+    } | null>(null);
+    const [workbookLoading, setWorkbookLoading] = useState(true);
+    const [saveStatus, setSaveStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
+    const [saveErrorDetail, setSaveErrorDetail] = useState<string | null>(null);
+    const hydrateDoneRef = useRef(false);
+    const sheetsRef = useRef<SiemWorkbookSheet[]>([]);
+    const activeSheetIndexRef = useRef(0);
+    const saveChainRef = useRef<Promise<void>>(Promise.resolve());
+    const saveDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const { toast } = useToast();
 
     const activeSheet = sheets[activeSheetIndex] ?? sheets[0];
 
+    const ruleNameColumn = useMemo(
+        () => (activeSheet ? findRuleNameColumn(activeSheet.columns) : null),
+        [activeSheet]
+    );
+    const monthColumns = useMemo(
+        () => activeSheet?.columns.filter(isMonthColumnHeader) ?? [],
+        [activeSheet]
+    );
+
     useEffect(() => {
+        sheetsRef.current = sheets;
+    }, [sheets]);
+
+    useEffect(() => {
+        activeSheetIndexRef.current = activeSheetIndex;
+    }, [activeSheetIndex]);
+
+    const persistWorkbookNow = useCallback(async () => {
+        const payload = {
+            sheets: sheetsRef.current as SiemWorkbookSheetDto[],
+            activeSheetIndex: activeSheetIndexRef.current,
+        };
+        setSaveStatus("saving");
+        setSaveErrorDetail(null);
         try {
-            const savedV2 = localStorage.getItem(STORAGE_KEY_V2);
-            if (savedV2) {
-                const parsed = JSON.parse(savedV2) as { sheets?: unknown[]; activeSheetIndex?: number };
-                if (parsed?.sheets && Array.isArray(parsed.sheets) && parsed.sheets.length > 0) {
-                    const migrated = parsed.sheets.map(migrateSheetFromStorage);
-                    setSheets(migrated);
-                    const idx = typeof parsed.activeSheetIndex === "number" ? parsed.activeSheetIndex : 0;
-                    setActiveSheetIndex(Math.min(Math.max(0, idx), migrated.length - 1));
-                    return;
-                }
+            if (payload.sheets.length === 0) {
+                await deleteSiemWorkbook();
+            } else {
+                await putSiemWorkbookResilient(payload);
             }
-            const savedUseCases = localStorage.getItem("siemUseCases");
-            const savedMonthCols = localStorage.getItem("siemMonthColumns");
-            if (savedUseCases) {
-                const parsedUseCases = JSON.parse(savedUseCases) as SiemUseCase[];
-                const parsedMonthCols = savedMonthCols ? (JSON.parse(savedMonthCols) as string[]) : computeDefaultMonthColumns();
-                if (parsedUseCases.length > 0) {
-                    setSheets([legacyUseCasesToDynamic("Sheet1", parsedUseCases, parsedMonthCols)]);
-                    setActiveSheetIndex(0);
-                }
-            }
-        } catch (error) {
-            console.warn("Failed to load SIEM data from localStorage:", error);
+            setSaveStatus("saved");
+        } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            console.warn("Failed to save SIEM workbook:", e);
+            setSaveErrorDetail(msg);
+            setSaveStatus("error");
         }
     }, []);
 
+    const queueWorkbookSave = useCallback(() => {
+        saveChainRef.current = saveChainRef.current
+            .then(() => persistWorkbookNow())
+            .catch(() => {
+                /* persistWorkbookNow already sets error state */
+            });
+    }, [persistWorkbookNow]);
+
+    const monthGmailRanges = useMemo(() => {
+        const out: Array<{ label: string; after_date: string; before_date: string }> = [];
+        for (const label of monthColumns) {
+            const range = monthColumnGmailDateRange(label);
+            if (!range) continue;
+            out.push({ label, after_date: range.afterDate, before_date: range.beforeDate });
+        }
+        return out;
+    }, [monthColumns]);
+
     useEffect(() => {
-        if (sheets.length === 0) {
+        let cancelled = false;
+        (async () => {
+            setWorkbookLoading(true);
             try {
-                localStorage.removeItem(STORAGE_KEY_V2);
-                localStorage.removeItem("siemUseCases");
-                localStorage.removeItem("siemMonthColumns");
-            } catch {
-                /* ignore */
+                const data = await getSiemWorkbook();
+                let nextSheets: SiemWorkbookSheet[] = [];
+                let nextIndex = 0;
+
+                if (data.sheets?.length) {
+                    nextSheets = normalizeWorkbookSheets(data.sheets.map((s) => migrateSheetFromStorage(s)));
+                    nextIndex =
+                        typeof data.activeSheetIndex === "number"
+                            ? Math.min(Math.max(0, data.activeSheetIndex), Math.max(0, nextSheets.length - 1))
+                            : 0;
+                } else {
+                    const legacy = readLegacyWorkbookFromBrowser();
+                    if (legacy?.sheets.length) {
+                        await putSiemWorkbookResilient({
+                            sheets: legacy.sheets,
+                            activeSheetIndex: legacy.activeSheetIndex,
+                        });
+                        clearLegacySiemBrowserStorage();
+                        nextSheets = legacy.sheets;
+                        nextIndex = legacy.activeSheetIndex;
+                        if (!cancelled) {
+                            toast({
+                                title: "Workbook migrated to database",
+                                description:
+                                    "Your browser copy was saved to SQLite. It will load from the server from now on.",
+                            });
+                        }
+                    }
+                }
+
+                if (!cancelled) {
+                    setSheets(nextSheets);
+                    setActiveSheetIndex(nextIndex);
+                }
+            } catch (e) {
+                const msg = e instanceof Error ? e.message : String(e);
+                if (!cancelled) {
+                    toast({
+                        title: "Could not load SIEM workbook",
+                        description: msg.includes("401") || /auth|session|sign/i.test(msg)
+                            ? "Sign in with Google from the Alerts page first, then reload."
+                            : msg,
+                        variant: "destructive",
+                    });
+                }
+            } finally {
+                if (!cancelled) {
+                    setWorkbookLoading(false);
+                    hydrateDoneRef.current = true;
+                }
             }
-            return;
-        }
-        try {
-            localStorage.setItem(STORAGE_KEY_V2, JSON.stringify({ sheets, activeSheetIndex }));
-        } catch (error) {
-            console.warn("Failed to save SIEM workbook to localStorage:", error);
-        }
-    }, [sheets, activeSheetIndex]);
+        })();
+        return () => {
+            cancelled = true;
+        };
+    }, [toast]);
+
+    useEffect(() => {
+        if (!hydrateDoneRef.current || workbookLoading || fetchingIncidents) return;
+
+        if (saveDebounceRef.current) window.clearTimeout(saveDebounceRef.current);
+        saveDebounceRef.current = window.setTimeout(() => {
+            queueWorkbookSave();
+        }, 1200);
+
+        return () => {
+            if (saveDebounceRef.current) window.clearTimeout(saveDebounceRef.current);
+        };
+    }, [sheets, activeSheetIndex, workbookLoading, fetchingIncidents, queueWorkbookSave]);
 
     useEffect(() => {
         if (activeSheetIndex >= sheets.length && sheets.length > 0) {
@@ -201,35 +399,198 @@ export default function SiemUseCases() {
         }
     }, [sheets.length, activeSheetIndex]);
 
-    const handleUpdateCell = useCallback((id: string, columnKey: string, value: string) => {
-        setSheets((prev) =>
-            prev.map((sheet, idx) => {
-                if (idx !== activeSheetIndex) return sheet;
-                return {
-                    ...sheet,
-                    rows: sheet.rows.map((row) =>
-                        row.id === id ? { ...row, [columnKey]: value } : row
-                    ),
-                };
-            })
-        );
-    }, [activeSheetIndex]);
+    const commitSheets = useCallback((next: SiemWorkbookSheet[]) => {
+        sheetsRef.current = next;
+        setSheets(next);
+    }, []);
 
-    const clearSiemData = useCallback(() => {
+    const persistFetchProgress = useCallback(async () => {
+        await saveChainRef.current;
+        await persistWorkbookNow();
+    }, [persistWorkbookNow]);
+
+    useEffect(() => {
+        if (!fetchingIncidents) return;
+        const onBeforeUnload = (e: BeforeUnloadEvent) => {
+            e.preventDefault();
+            e.returnValue = "";
+        };
+        window.addEventListener("beforeunload", onBeforeUnload);
+        return () => window.removeEventListener("beforeunload", onBeforeUnload);
+    }, [fetchingIncidents]);
+
+    const fetchLatestIncidentsForRowIds = useCallback(
+        async (rowIds: string[], options?: { monthLabels?: string[] }) => {
+            if (!activeSheet || !ruleNameColumn || monthGmailRanges.length === 0) {
+                toast({
+                    title: "Cannot fetch incidents",
+                    description:
+                        "Active sheet needs a Rule Name column and month columns (e.g. May 26). Connect Gmail from Alerts first.",
+                    variant: "destructive",
+                });
+                return;
+            }
+            const labelFilter = options?.monthLabels?.filter(Boolean);
+            const monthsToFetch =
+                labelFilter && labelFilter.length > 0
+                    ? monthGmailRanges.filter((m) => labelFilter.includes(m.label))
+                    : monthGmailRanges;
+            if (monthsToFetch.length === 0) {
+                toast({
+                    title: "Unknown month",
+                    description: "Pick a month column that exists on this sheet.",
+                    variant: "destructive",
+                });
+                return;
+            }
+            const idSet = new Set(rowIds);
+            const items = activeSheet.rows
+                .filter((row) => idSet.has(row.id))
+                .map((row) => ({
+                    rule_name: (row[ruleNameColumn] ?? "").trim(),
+                    row_id: row.id,
+                    months: monthsToFetch,
+                }))
+                .filter((item) => item.rule_name.length > 0);
+
+            if (!items.length) {
+                toast({
+                    title: "No rules to fetch",
+                    description: "Selected rows have no Rule Name value.",
+                    variant: "destructive",
+                });
+                return;
+            }
+
+            const monthScopeLabel =
+                monthsToFetch.length === monthGmailRanges.length
+                    ? `all ${monthsToFetch.length} months`
+                    : monthsToFetch.map((m) => m.label).join(", ");
+
+            setFetchingIncidents(true);
+            setFetchProgress({ done: 0, total: items.length });
+            try {
+                let filled = 0;
+                // One rule × one month per request — avoids long hangs and "Failed to fetch" when the dev server reloads.
+                for (let i = 0; i < items.length; i++) {
+                    const item = items[i]!;
+                    for (const month of monthsToFetch) {
+                        setFetchProgress({
+                            done: i,
+                            total: items.length,
+                            monthLabel: month.label,
+                        });
+                        const res = await postGmailSiemRuleLatestIncidentsResilient({
+                            items: [
+                                {
+                                    rule_name: item.rule_name,
+                                    row_id: item.row_id,
+                                    months: [month],
+                                },
+                            ],
+                        });
+                        const nextSheets = mergeIncidentResultsIntoSheets(
+                            sheetsRef.current,
+                            activeSheetIndexRef.current,
+                            res.results
+                        );
+                        commitSheets(nextSheets);
+                        await persistFetchProgress();
+                        for (const row of res.results) {
+                            for (const cell of Object.values(row.by_month)) {
+                                if (cell.mapped_id ?? cell.latest_incident_id ?? cell.latest_case_id) {
+                                    filled += 1;
+                                }
+                            }
+                        }
+                    }
+                    setFetchProgress({ done: i + 1, total: items.length });
+                }
+                toast({
+                    title: "Latest incidents fetched",
+                    description: `Processed ${items.length} rule(s) for ${monthScopeLabel}. ${filled} month cell(s) have INC/CS; others are marked NA when no matching alert was found.`,
+                });
+            } catch (e) {
+                await persistFetchProgress();
+                const msg = e instanceof Error ? e.message : String(e);
+                const hint = /failed to fetch|network/i.test(msg)
+                    ? " Partial results were saved to the database. Retry to continue, or refresh to load saved rows."
+                    : "";
+                toast({
+                    title: "Gmail fetch failed",
+                    description: msg + hint,
+                    variant: "destructive",
+                });
+            } finally {
+                setFetchingIncidents(false);
+                setFetchingRowId(null);
+                setFetchProgress(null);
+            }
+        },
+        [activeSheet, commitSheets, monthGmailRanges, persistFetchProgress, ruleNameColumn, toast]
+    );
+
+    const handleFetchAllIncidents = useCallback(
+        (monthLabels?: string[]) => {
+            if (!activeSheet?.rows.length) return;
+            void fetchLatestIncidentsForRowIds(
+                activeSheet.rows.map((r) => r.id),
+                monthLabels?.length ? { monthLabels } : undefined
+            );
+        },
+        [activeSheet, fetchLatestIncidentsForRowIds]
+    );
+
+    const handleFetchRowIncidents = useCallback(
+        (rowId: string) => {
+            setFetchingRowId(rowId);
+            void fetchLatestIncidentsForRowIds([rowId]);
+        },
+        [fetchLatestIncidentsForRowIds]
+    );
+
+    const handleUpdateCell = useCallback(
+        (id: string, columnKey: string, value: string) => {
+            setSheets((prev) => {
+                const next = prev.map((sheet, idx) => {
+                    if (idx !== activeSheetIndex) return sheet;
+                    return {
+                        ...sheet,
+                        rows: sheet.rows.map((row) =>
+                            row.id === id ? { ...row, [columnKey]: value } : row
+                        ),
+                    };
+                });
+                sheetsRef.current = next;
+                return next;
+            });
+            if (
+                isMonthColumnHeader(columnKey) &&
+                hydrateDoneRef.current &&
+                !workbookLoading &&
+                !fetchingIncidents
+            ) {
+                void persistWorkbookNow();
+            }
+        },
+        [activeSheetIndex, workbookLoading, fetchingIncidents, persistWorkbookNow]
+    );
+
+    const clearSiemData = useCallback(async () => {
         setSheets([]);
         setActiveSheetIndex(0);
+        clearLegacySiemBrowserStorage();
         try {
-            localStorage.removeItem(STORAGE_KEY_V2);
-            localStorage.removeItem("siemUseCases");
-            localStorage.removeItem("siemMonthColumns");
-        } catch {
-            /* ignore */
+            await deleteSiemWorkbook();
+        } catch (e) {
+            console.warn("Failed to clear SIEM workbook on server:", e);
         }
     }, []);
 
     const handleClearSavedClick = useCallback(() => {
-        clearSiemData();
-        toast({ title: "Cleared", description: "SIEM use case data was removed from this browser." });
+        void clearSiemData().then(() => {
+            toast({ title: "Cleared", description: "SIEM workbook removed from the database." });
+        });
     }, [clearSiemData, toast]);
 
     const applyWorkbook = useCallback(
@@ -242,9 +603,10 @@ export default function SiemUseCases() {
                 });
                 return;
             }
-            setSheets(nextSheets);
+            const normalized = normalizeWorkbookSheets(nextSheets);
+            setSheets(normalized);
             setActiveSheetIndex(0);
-            const totalRows = nextSheets.reduce((n, s) => n + s.rows.length, 0);
+            const totalRows = normalized.reduce((n, s) => n + s.rows.length, 0);
             toast({
                 title: "File uploaded",
                 description: `${nextSheets.length} sheet(s), ${totalRows} row(s) total.`,
@@ -371,15 +733,12 @@ export default function SiemUseCases() {
                     onDragOver={handleDragOver}
                     onDragLeave={handleDragLeave}
                 >
-                    <header className="z-10 shrink-0 border-b bg-background/95 px-6 py-3">
-                        <div className="flex flex-wrap items-center gap-3 justify-between">
+                    <header className="z-10 shrink-0 border-b bg-background/95 px-3 py-1.5">
+                        <div className="flex flex-wrap items-center gap-2 justify-between">
                             <div className="min-w-0">
-                                <h1 className="text-2xl font-bold text-foreground truncate">SIEM Use case</h1>
-                                <p className="text-sm text-muted-foreground">
-                                    Each Excel tab uses <strong>only its own columns</strong> (no extra month columns). Data is saved in this browser.
-                                </p>
+                                <h1 className="text-lg font-semibold text-foreground truncate">SIEM Use case</h1>
                             </div>
-                            <div className="flex flex-wrap items-center gap-2 shrink-0">
+                            <div className="flex flex-wrap items-center gap-1.5 shrink-0">
                                 <label>
                                     <input
                                         type="file"
@@ -387,18 +746,108 @@ export default function SiemUseCases() {
                                         onChange={handleFileInput}
                                         className="hidden"
                                     />
-                                    <Button variant="outline" size="sm" asChild>
+                                    <Button variant="outline" size="sm" className="h-7 px-2 text-xs" asChild>
                                         <span className="cursor-pointer">
-                                            <Upload className="mr-2 h-4 w-4" />
-                                            Upload file
+                                            <Upload className="mr-1 h-3.5 w-3.5" />
+                                            Upload
                                         </span>
                                     </Button>
                                 </label>
                                 {sheets.length > 0 && (
-                                    <Button variant="outline" size="sm" onClick={handleClearSavedClick}>
-                                        <Trash2 className="mr-2 h-4 w-4" />
-                                        Clear saved data
-                                    </Button>
+                                    <>
+                                        <DropdownMenu>
+                                            <DropdownMenuTrigger asChild>
+                                                <Button
+                                                    variant="outline"
+                                                    size="sm"
+                                                    className="h-7 px-2 text-xs max-w-[13rem] truncate"
+                                                    disabled={
+                                                        fetchingIncidents ||
+                                                        !ruleNameColumn ||
+                                                        monthGmailRanges.length === 0
+                                                    }
+                                                    title={
+                                                        ruleNameColumn
+                                                            ? "Search Gmail per rule and month; write INC (or CS fallback) into month columns"
+                                                            : "Upload a sheet with a Rule Name column first"
+                                                    }
+                                                >
+                                                    {fetchingIncidents && !fetchingRowId ? (
+                                                        <Loader2 className="mr-1 h-3.5 w-3.5 shrink-0 animate-spin" />
+                                                    ) : (
+                                                        <RefreshCw className="mr-1 h-3.5 w-3.5 shrink-0" />
+                                                    )}
+                                                    <span className="truncate">
+                                                        {fetchProgress && !fetchingRowId
+                                                            ? `${fetchProgress.done}/${fetchProgress.total}${
+                                                                  fetchProgress.monthLabel
+                                                                      ? ` · ${fetchProgress.monthLabel}`
+                                                                      : ""
+                                                              }`
+                                                            : "Fetch incidents"}
+                                                    </span>
+                                                    {!fetchingIncidents && (
+                                                        <ChevronDown className="ml-1 h-3 w-3 shrink-0 opacity-60" />
+                                                    )}
+                                                </Button>
+                                            </DropdownMenuTrigger>
+                                            <DropdownMenuContent align="end" className="w-52">
+                                                <DropdownMenuLabel className="text-xs font-normal text-muted-foreground">
+                                                    All rules on this sheet
+                                                </DropdownMenuLabel>
+                                                <DropdownMenuItem
+                                                    onClick={() => handleFetchAllIncidents()}
+                                                    disabled={fetchingIncidents}
+                                                >
+                                                    All month columns ({monthColumns.length})
+                                                </DropdownMenuItem>
+                                                {monthColumns.length > 0 && <DropdownMenuSeparator />}
+                                                {monthColumns.map((label) => (
+                                                    <DropdownMenuItem
+                                                        key={label}
+                                                        onClick={() => handleFetchAllIncidents([label])}
+                                                        disabled={fetchingIncidents}
+                                                    >
+                                                        {label} only
+                                                    </DropdownMenuItem>
+                                                ))}
+                                            </DropdownMenuContent>
+                                        </DropdownMenu>
+                                        <Button
+                                            variant="outline"
+                                            size="sm"
+                                            className="h-7 px-2 text-xs"
+                                            onClick={handleClearSavedClick}
+                                        >
+                                            <Trash2 className="mr-1 h-3.5 w-3.5" />
+                                            Clear
+                                        </Button>
+                                    </>
+                                )}
+                                {saveStatus === "saving" && (
+                                    <span className="text-[10px] text-muted-foreground">
+                                        {fetchingIncidents ? "Saving to DB…" : "Saving…"}
+                                    </span>
+                                )}
+                                {saveStatus === "saved" && sheets.length > 0 && !fetchingIncidents && (
+                                    <span className="text-[10px] text-muted-foreground">Saved</span>
+                                )}
+                                {fetchingIncidents && saveStatus !== "saving" && saveStatus !== "error" && (
+                                    <span
+                                        className="text-[10px] text-muted-foreground"
+                                        title="Each completed month is written to SQLite — safe to refresh and resume later"
+                                    >
+                                        Auto-save on
+                                    </span>
+                                )}
+                                {saveStatus === "error" && (
+                                    <span
+                                        className="text-xs text-destructive max-w-[14rem] truncate"
+                                        title={saveErrorDetail ?? "Save failed"}
+                                    >
+                                        Save failed
+                                        {saveErrorDetail ? `: ${saveErrorDetail}` : ""}
+                                    </span>
                                 )}
                                 <ThemeToggle />
                                 <NotificationsPanel />
@@ -406,8 +855,41 @@ export default function SiemUseCases() {
                         </div>
                     </header>
 
-                    <div className="min-h-0 flex-1 overflow-auto p-6">
-                        {sheets.length === 0 ? (
+                    {fetchingIncidents && fetchProgress && (
+                        <div
+                            className="shrink-0 border-b bg-primary/5 px-3 py-2"
+                            role="status"
+                            aria-live="polite"
+                        >
+                            <div className="flex flex-wrap items-center justify-between gap-2 mb-1.5">
+                                <p className="text-xs font-medium text-foreground">
+                                    {fetchingRowId ? "Fetching incidents (single rule)" : "Fetching incidents (all rules)"}
+                                    {" · "}
+                                    {fetchProgress.done}/{fetchProgress.total} rules
+                                    {fetchProgress.monthLabel ? ` · ${fetchProgress.monthLabel}` : ""}
+                                </p>
+                                <span className="text-[10px] text-muted-foreground">
+                                    Auto-save on — safe to refresh and resume
+                                </span>
+                            </div>
+                            <Progress
+                                value={
+                                    fetchProgress.total > 0
+                                        ? Math.round((fetchProgress.done / fetchProgress.total) * 100)
+                                        : 0
+                                }
+                                className="h-1.5"
+                            />
+                        </div>
+                    )}
+
+                    <div className="min-h-0 flex-1 flex flex-col overflow-hidden p-2">
+                        {workbookLoading ? (
+                            <Card className="border-dashed max-w-2xl mx-auto p-12 text-center">
+                                <Loader2 className="h-8 w-8 animate-spin mx-auto mb-3 text-muted-foreground" />
+                                <p className="text-muted-foreground">Loading workbook from database…</p>
+                            </Card>
+                        ) : sheets.length === 0 ? (
                             <Card
                                 className={`border-dashed max-w-2xl mx-auto ${isDragging ? "border-primary bg-primary/5" : ""}`}
                             >
@@ -428,21 +910,14 @@ export default function SiemUseCases() {
                                 </CardContent>
                             </Card>
                         ) : (
-                            <Card className="overflow-hidden border border-border shadow-sm flex flex-col max-h-[calc(100vh-8rem)]">
-                                <CardHeader className="py-3 px-4 bg-muted/30 border-b shrink-0">
-                                    <CardTitle className="text-base">Use case workbook</CardTitle>
-                                    <CardDescription className="text-xs">
-                                        {sheets.length} sheet(s) • {sheets.reduce((n, s) => n + s.rows.length, 0)} row(s) total • drag another file to replace
-                                    </CardDescription>
-                                </CardHeader>
-
-                                <div className="flex items-center gap-0.5 border-b bg-muted/30 px-1 py-1 shrink-0">
-                                    <div className="flex items-center gap-0.5 shrink-0 mr-1">
+                            <Card className="overflow-hidden border border-border shadow-sm flex flex-col flex-1 min-h-0">
+                                <div className="flex items-center gap-1 border-b bg-muted/40 px-1.5 py-0.5 shrink-0 min-h-8">
+                                    <div className="flex items-center gap-0 shrink-0">
                                         <Button
                                             type="button"
                                             variant="ghost"
                                             size="icon"
-                                            className="h-7 w-7"
+                                            className="h-6 w-6"
                                             disabled={activeSheetIndex <= 0}
                                             onClick={goFirst}
                                             title="First sheet"
@@ -453,7 +928,7 @@ export default function SiemUseCases() {
                                             type="button"
                                             variant="ghost"
                                             size="icon"
-                                            className="h-7 w-7"
+                                            className="h-6 w-6"
                                             disabled={activeSheetIndex <= 0}
                                             onClick={goPrev}
                                             title="Previous sheet"
@@ -464,7 +939,7 @@ export default function SiemUseCases() {
                                             type="button"
                                             variant="ghost"
                                             size="icon"
-                                            className="h-7 w-7"
+                                            className="h-6 w-6"
                                             disabled={activeSheetIndex >= sheets.length - 1}
                                             onClick={goNext}
                                             title="Next sheet"
@@ -475,7 +950,7 @@ export default function SiemUseCases() {
                                             type="button"
                                             variant="ghost"
                                             size="icon"
-                                            className="h-7 w-7"
+                                            className="h-6 w-6"
                                             disabled={activeSheetIndex >= sheets.length - 1}
                                             onClick={goLast}
                                             title="Last sheet"
@@ -493,7 +968,7 @@ export default function SiemUseCases() {
                                                 <TabsTrigger
                                                     key={`${s.name}-${i}`}
                                                     value={String(i)}
-                                                    className="shrink-0 rounded-none border-b-2 border-transparent data-[state=active]:border-primary data-[state=active]:bg-background data-[state=active]:text-primary px-3 py-1.5 text-sm font-medium"
+                                                    className="shrink-0 rounded-none border-b-2 border-transparent data-[state=active]:border-primary data-[state=active]:bg-background data-[state=active]:text-primary px-2 py-1 text-xs font-medium h-7"
                                                     title={s.name}
                                                 >
                                                     {s.name}
@@ -501,14 +976,24 @@ export default function SiemUseCases() {
                                             ))}
                                         </TabsList>
                                     </Tabs>
+                                    <span className="ml-auto shrink-0 text-[10px] text-muted-foreground whitespace-nowrap pl-2">
+                                        {sheets.reduce((n, s) => n + s.rows.length, 0)} rows · {sheets.length} sheets
+                                    </span>
                                 </div>
 
-                                <CardContent className="p-0 sm:p-4 flex-1 min-h-0 overflow-auto">
+                                <CardContent className="p-0 flex-1 min-h-0 flex flex-col overflow-hidden">
                                     {activeSheet && (
                                         <SiemDynamicUseCaseTable
                                             columns={activeSheet.columns}
                                             rows={activeSheet.rows}
                                             onUpdateCell={handleUpdateCell}
+                                            ruleNameColumn={ruleNameColumn}
+                                            onFetchRowIncidents={
+                                                monthGmailRanges.length > 0 && ruleNameColumn
+                                                    ? handleFetchRowIncidents
+                                                    : undefined
+                                            }
+                                            fetchingRowId={fetchingRowId}
                                         />
                                     )}
                                 </CardContent>

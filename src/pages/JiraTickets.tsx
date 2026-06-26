@@ -4,6 +4,14 @@ import { SOCSidebar } from "@/components/SOCSidebar";
 import { ThemeToggle } from "@/components/ThemeToggle";
 import { NotificationsPanel } from "@/components/NotificationsPanel";
 import { CsvDataTable } from "@/components/CsvDataTable";
+import { ReportStatusSummaryCard } from "@/components/ReportStatusSummaryCard";
+import { FetchAllReportButtons, type FetchAllProgressState } from "@/components/FetchAllReportButtons";
+import {
+  canResumeFetchAll,
+  clearFetchAllProgress as clearFetchAllCheckpoint,
+  setFetchAllProgress as saveFetchAllCheckpoint,
+} from "@/lib/fetchAllProgress";
+import { waitForBackend } from "@/api/client";
 import { EmailDetailSheet } from "@/components/EmailDetailSheet";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -45,10 +53,12 @@ import {
 import {
   getGmailMessageBySearch,
   fetchLatestStatusFromEmail,
+  postGmailLatestStatusBatchResilient,
   GMAIL_INCIDENT_LOOKUP_LOOKBACK_DAYS,
   type LatestStatusFromEmailResult,
+  type LatestStatusBatchResult,
 } from "@/api/gmail";
-import { fetchJiraIssues } from "@/api/jira";
+import { matchJiraIssuesByTokens } from "@/api/jira";
 import { toast } from "@/hooks/use-toast";
 import type { GmailMessage } from "@/types/gmail";
 import type { CsvAttachment } from "@/types/gmail";
@@ -59,6 +69,10 @@ import {
   extractLegacyMonths,
   monthDateRange,
 } from "@/lib/legacyDailyAlertsMigration";
+import {
+  buildFetchAllGmailQueries,
+  FETCH_ALL_GMAIL_BATCH_SIZE,
+} from "@/lib/fetchAllGmailQueries";
 
 /** Normalize header for comparison (lowercase, no spaces). */
 function norm(h: string): string {
@@ -240,7 +254,12 @@ function parseJiraTableRowIndex(row: Record<string, string>): number {
 }
 
 /** Tokens to match Jira issue summary (INC# in URLs, summary prefix before " - ", etc.). */
-function collectJiraLinkMatchTokens(incidentId: string, servicenow: string, displaySummary: string): string[] {
+function collectJiraLinkMatchTokens(
+  incidentId: string,
+  servicenow: string,
+  displaySummary: string,
+  description = ""
+): string[] {
   const out = new Set<string>();
   const push = (s: string) => {
     const t = s.trim().toLowerCase();
@@ -250,17 +269,28 @@ function collectJiraLinkMatchTokens(incidentId: string, servicenow: string, disp
     const m = blob.match(/\b(INC\d+)\b/gi);
     if (m) for (const x of m) push(x);
   };
+  const pullCs = (blob: string) => {
+    const m = blob.match(/\b(CS\d{5,})\b/gi);
+    if (m) for (const x of m) push(x);
+  };
   push(incidentId);
   push(servicenow);
   pullInc(incidentId);
   pullInc(servicenow);
+  pullCs(incidentId);
+  pullCs(servicenow);
   const sum = displaySummary.trim();
   if (sum) {
     const head = sum.split(/\s-\s/).map((p) => p.trim()).filter(Boolean)[0];
     if (head) {
       push(head);
       pullInc(head);
+      pullCs(head);
     }
+  }
+  if (description.trim()) {
+    pullInc(description);
+    pullCs(description);
   }
   return [...out].sort((a, b) => b.length - a.length);
 }
@@ -533,7 +563,8 @@ export default function JiraTickets() {
   const [jiraCreatingKey, setJiraCreatingKey] = useState<string | null>(null);
   const [fetchingStatusKey, setFetchingStatusKey] = useState<string | null>(null);
   const [fetchingAllStatus, setFetchingAllStatus] = useState(false);
-  const [fetchAllProgress, setFetchAllProgress] = useState<{ current: number; total: number } | null>(null);
+  const [fetchAllProgress, setFetchAllProgress] = useState<FetchAllProgressState | null>(null);
+  const [fetchAllResumeVersion, setFetchAllResumeVersion] = useState(0);
   const [creatingAllJira, setCreatingAllJira] = useState(false);
   const [createAllJiraProgress, setCreateAllJiraProgress] = useState<{ current: number; total: number } | null>(null);
   const [createAllConfirmOpen, setCreateAllConfirmOpen] = useState(false);
@@ -708,96 +739,206 @@ export default function JiraTickets() {
     }
   }, [firstReport, setLocalJiraCreated]);
 
-  const handleFetchAllLatestStatus = useCallback(async () => {
-    if (!transformedData?.rows.length || !firstReport) return;
-    setFetchingAllStatus(true);
-    setFetchAllProgress({ current: 0, total: transformedData.rows.length });
-    let updated = 0;
-    let datesSet = 0;
-    let mergedNtt = 0;
-    let mergedDateFromCreated = 0;
-    const total = transformedData.rows.length;
-    const headers = firstReport.csvAttachment?.headers ?? [];
-    try {
-      for (let i = 0; i < transformedData.rows.length; i++) {
-        setFetchAllProgress({ current: i + 1, total });
-        const { original } = transformedData.rows[i];
-        const rowIndex = i;
-        const rowKey = dbRowKey(firstReport.id, rowIndex);
-        if (headers.length) {
-          const st = normalizeStatus(getRowStatus(original, headers, rowKey, resolvedStatusOverrides));
-          if (st === "Merged") {
-            const createdVal = getRowValue(original, "Created", "Created On").trim();
-            await persistOverride(rowIndex, "closure_comment", "NTT");
-            if (createdVal) {
-              mergedDateFromCreated++;
-              await persistOverride(rowIndex, "closure_date", createdVal);
+  const fetchAllResume = useMemo(() => {
+    if (!firstReport?.id || !transformedData?.rows.length) {
+      return { canResume: false, resumeFromIndex: 0 };
+    }
+    return canResumeFetchAll(firstReport.id, transformedData.rows.length);
+  }, [firstReport?.id, transformedData?.rows.length, fetchAllResumeVersion]);
+
+  useEffect(() => {
+    setFetchAllResumeVersion((v) => v + 1);
+  }, [firstReport?.id]);
+
+  const handleFetchAllLatestStatus = useCallback(
+    async (startFromBeginning = false) => {
+      if (!transformedData?.rows.length || !firstReport) return;
+      const messageId = firstReport.id;
+      const total = transformedData.rows.length;
+      const headers = firstReport.csvAttachment?.headers ?? [];
+
+      if (startFromBeginning) {
+        clearFetchAllCheckpoint(messageId);
+      }
+      const { resumeFromIndex } = startFromBeginning
+        ? { resumeFromIndex: 0 }
+        : canResumeFetchAll(messageId, total);
+      const startIndex = resumeFromIndex;
+
+      if (startIndex > 0) {
+        toast({
+          title: "Resuming fetch all",
+          description: `Continuing at row ${startIndex + 1} of ${total}. Progress is saved in this browser.`,
+        });
+      }
+
+      setFetchingAllStatus(true);
+      setFetchAllProgress({ current: startIndex + 1, total, gmailChecked: 0, updated: 0, skippedNoId: 0, mergedSkipped: 0, errors: 0, noClosureInGmail: 0, phase: "scan" });
+      let updated = 0;
+      let datesSet = 0;
+      let mergedNtt = 0;
+      let mergedDateFromCreated = 0;
+      let gmailChecked = 0;
+      let skippedNoId = 0;
+      let errors = 0;
+      let noClosureInGmail = 0;
+      let consecutiveErrors = 0;
+      let aborted = false;
+      const bumpProgress = (current: number, phase: "scan" | "gmail" = "scan") => {
+        setFetchAllProgress({
+          current,
+          total,
+          gmailChecked,
+          updated,
+          skippedNoId,
+          mergedSkipped: mergedNtt,
+          errors,
+          noClosureInGmail,
+          phase,
+        });
+      };
+      try {
+        type GmailQueueItem = { i: number; rowIndex: number; queries: string[] };
+        const gmailQueue: GmailQueueItem[] = [];
+
+        for (let i = startIndex; i < transformedData.rows.length; i++) {
+          if (aborted) break;
+          bumpProgress(i + 1);
+          const { original } = transformedData.rows[i];
+          const rowIndex = i;
+          const rowKey = dbRowKey(firstReport.id, rowIndex);
+          if (headers.length) {
+            const st = normalizeStatus(getRowStatus(original, headers, rowKey, resolvedStatusOverrides));
+            if (st === "Merged") {
+              const createdVal = getRowValue(original, "Created", "Created On").trim();
+              await persistOverride(rowIndex, "closure_comment", "NTT");
+              if (createdVal) {
+                mergedDateFromCreated++;
+                await persistOverride(rowIndex, "closure_date", createdVal);
+              }
+              mergedNtt++;
+              saveFetchAllCheckpoint(messageId, i, total);
+              continue;
             }
-            mergedNtt++;
+          }
+          const queries = buildFetchAllGmailQueries(original);
+          if (queries.length === 0) {
+            skippedNoId++;
+            saveFetchAllCheckpoint(messageId, i, total);
             continue;
           }
+          gmailQueue.push({ i, rowIndex, queries });
         }
-        const servicenowTicket = getRowValue(original, "ServicenowTicket", "ServiceNow Ticket", "ServicenowT");
-        const incidentId = getRowValue(original, "IncidentID", "Incident ID");
-        const searchFirst = servicenowTicket || incidentId;
-        const searchFallback = servicenowTicket ? incidentId : "";
-        const extraQs = extraGmailIncidentQueries(original);
-        if (!searchFirst.trim() && !searchFallback.trim() && extraQs.length === 0) continue;
-        try {
-          const tried = new Set<string>();
-          let result: LatestStatusFromEmailResult = { suggestedStatus: null };
-          const run = async (q: string) => {
-            const t = q.trim();
-            if (!t || tried.has(t)) return;
-            tried.add(t);
-            result = await fetchLatestStatusFromEmail({ q: t });
-          };
-          if (searchFirst.trim()) await run(searchFirst);
-          if (!result.suggestedStatus && searchFallback.trim()) await run(searchFallback);
-          if (!result.suggestedStatus) {
-            for (const q of extraQs) {
-              await run(q);
-              if (result.suggestedStatus) break;
-            }
+
+        const applyClosure = async (item: GmailQueueItem, result: LatestStatusBatchResult) => {
+          if (result.suggestedStatus !== "Closed" && result.suggestedStatus !== "Incident Auto Closed") {
+            return;
           }
-          if (result.suggestedStatus === "Closed" || result.suggestedStatus === "Incident Auto Closed") {
-            const statusToSet = result.suggestedStatus === "Incident Auto Closed" ? "Incident Auto Closed" : "Closed";
-            const closure = (result.suggestedClosureComment ?? "").trim() || "Closed from email";
-            const dateIso = (result.matchedEmailDateIso ?? "").trim();
-            await persistOverride(rowIndex, "status", statusToSet);
-            await persistOverride(rowIndex, "closure_comment", closure);
-            if (dateIso) {
-              datesSet++;
-              await persistOverride(rowIndex, "closure_date", dateIso);
-            }
-            updated++;
+          const statusToSet =
+            result.suggestedStatus === "Incident Auto Closed" ? "Incident Auto Closed" : "Closed";
+          const closure = (result.suggestedClosureComment ?? "").trim() || "Closed from email";
+          const dateIso = (result.matchedEmailDateIso ?? "").trim();
+          await persistOverride(item.rowIndex, "status", statusToSet);
+          await persistOverride(item.rowIndex, "closure_comment", closure);
+          if (dateIso) {
+            datesSet++;
+            await persistOverride(item.rowIndex, "closure_date", dateIso);
           }
-        } catch {
-          /* skip this row on error */
+          updated++;
+        };
+
+        for (let b = 0; b < gmailQueue.length && !aborted; b += FETCH_ALL_GMAIL_BATCH_SIZE) {
+          const chunk = gmailQueue.slice(b, b + FETCH_ALL_GMAIL_BATCH_SIZE);
+          const lastRow = chunk[chunk.length - 1]!.i;
+          bumpProgress(lastRow + 1, "gmail");
+          try {
+            const { results } = await postGmailLatestStatusBatchResilient({
+              items: chunk.map((c) => ({ id: String(c.i), queries: c.queries })),
+            });
+            for (const item of chunk) {
+              gmailChecked++;
+              const result = results.find((r) => r.id === String(item.i));
+              if (!result) {
+                errors++;
+                continue;
+              }
+              if (result.error && !result.suggestedStatus) {
+                if (result.notFound || /no matching email/i.test(result.error)) {
+                  noClosureInGmail++;
+                } else {
+                  errors++;
+                }
+              } else if (!result.suggestedStatus) {
+                noClosureInGmail++;
+              }
+              await applyClosure(item, result);
+            }
+            consecutiveErrors = 0;
+          } catch {
+            errors += chunk.length;
+            consecutiveErrors++;
+            if (consecutiveErrors >= 2) {
+              toast({
+                title: "Backend connection lost",
+                description: "Waiting for the server… Restart python main.py in Backend/ if needed.",
+              });
+              const up = await waitForBackend(30_000, 5_000);
+              if (!up) {
+                toast({
+                  title: "Fetch paused",
+                  description: `Stopped around row ${lastRow + 1} of ${total}. Restart backend, then Resume.`,
+                  variant: "destructive",
+                });
+                aborted = true;
+              } else {
+                consecutiveErrors = 0;
+                b -= FETCH_ALL_GMAIL_BATCH_SIZE;
+              }
+            }
+          } finally {
+            saveFetchAllCheckpoint(messageId, lastRow, total);
+          }
         }
+        if (!aborted) {
+          clearFetchAllCheckpoint(messageId);
+        }
+        const parts: string[] = [];
+        if (aborted) {
+          parts.push("checkpoint saved — use Resume after restarting the backend");
+        } else if (startIndex > 0) {
+          parts.push(`resumed from row ${startIndex + 1}`);
+        }
+        parts.push(`Gmail checked ${gmailChecked} of ${total} rows`);
+        if (mergedNtt > 0) {
+          parts.push(
+            mergedDateFromCreated > 0
+              ? `${mergedNtt} merged → NTT (${mergedDateFromCreated} with closure date from Created)`
+              : `${mergedNtt} merged → NTT`
+          );
+        }
+        if (updated > 0) {
+          parts.push(
+            datesSet > 0
+              ? `${updated} closed from email (${datesSet} with Gmail closure date)`
+              : `${updated} closed from email`
+          );
+        }
+        if (skippedNoId > 0) parts.push(`${skippedNoId} skipped (no incident/ticket ID)`);
+        if (noClosureInGmail > 0) parts.push(`${noClosureInGmail} still open (no closure email in Gmail)`);
+        if (errors > 0) parts.push(`${errors} Gmail lookup errors (retry or resume)`);
+        if (updated === 0 && mergedNtt === 0) parts.push("No rows updated");
+        toast({
+          title: aborted ? "Fetch paused (this day)" : "Fetch all complete (this day)",
+          description: parts.join("; ") + ".",
+        });
+      } finally {
+        setFetchingAllStatus(false);
+        setFetchAllProgress(null);
+        setFetchAllResumeVersion((v) => v + 1);
       }
-      const parts: string[] = [];
-      if (mergedNtt > 0) {
-        parts.push(
-          mergedDateFromCreated > 0
-            ? `${mergedNtt} merged → NTT (${mergedDateFromCreated} with closure date from Created)`
-            : `${mergedNtt} merged → NTT`
-        );
-      }
-      if (updated > 0) {
-        parts.push(datesSet > 0 ? `${updated} closed from email (${datesSet} with Gmail closure date)` : `${updated} closed from email`);
-      }
-      if (parts.length === 0) parts.push("No rows updated");
-      parts.push(`${total - mergedNtt - updated} unchanged`);
-      toast({
-        title: "Fetch all complete (this day)",
-        description: parts.join("; ") + ".",
-      });
-    } finally {
-      setFetchingAllStatus(false);
-      setFetchAllProgress(null);
-    }
-  }, [transformedData, firstReport, resolvedStatusOverrides, persistOverride]);
+    },
+    [transformedData, firstReport, resolvedStatusOverrides, persistOverride]
+  );
 
   const handleCreateAllInJiraClick = useCallback(() => {
     if (!transformedData?.rows.length || !firstReport) return;
@@ -894,9 +1035,12 @@ export default function JiraTickets() {
     if (!transformedData?.rows.length || !firstReport) return;
     setLinkingExistingJira(true);
     try {
-      const issues = await fetchJiraIssues(1500);
-      const usedIssueKeys = new Set<string>();
-      let linked = 0;
+      const rowPlans: Array<{
+        rowIndex: number;
+        rowKey: string;
+        tokens: string[];
+      }> = [];
+
       for (let i = 0; i < transformedData.rows.length; i++) {
         const { original, display } = transformedData.rows[i];
         const rowIndex = i;
@@ -905,36 +1049,52 @@ export default function JiraTickets() {
         const incidentId = primaryIncidentIdFromRow(original) || getRowValue(original, "IncidentID", "Incident ID");
         const servicenow = getRowValue(original, "ServicenowTicket", "ServiceNow Ticket", "ServicenowT");
         const summary = (display.Summary ?? "").trim();
-        const tokens = collectJiraLinkMatchTokens(incidentId, servicenow, summary);
-        const match = issues.find((iss) => {
-          if (usedIssueKeys.has(iss.key)) return false;
-          const s = (iss.summary ?? "").toLowerCase();
-          for (const tok of tokens) {
-            if (tok && s.includes(tok)) return true;
+        const tokens = collectJiraLinkMatchTokens(
+          incidentId,
+          servicenow,
+          summary,
+          display.Description ?? ""
+        );
+        if (tokens.length) rowPlans.push({ rowIndex, rowKey, tokens });
+      }
+
+      const uniqueTokens = [...new Set(rowPlans.flatMap((p) => p.tokens))];
+      const matchRes = await matchJiraIssuesByTokens(uniqueTokens, 5);
+      const matchesByToken = matchRes.matches;
+      const tokensWithHits = matchRes.stats?.tokensWithHits ?? 0;
+
+      const usedIssueKeys = new Set<string>();
+      let linked = 0;
+      for (const plan of rowPlans) {
+        let match: { key: string } | null = null;
+        for (const tok of plan.tokens) {
+          const hits = matchesByToken[tok.toLowerCase()] ?? [];
+          const found = hits.find((iss) => !usedIssueKeys.has(iss.key));
+          if (found) {
+            match = found;
+            break;
           }
-          return false;
-        });
-        if (match) {
-          usedIssueKeys.add(match.key);
-          try {
-            await linkJiraTicket({
-              messageId: firstReport.id,
-              rowIndex,
-              jiraKey: match.key,
-            });
-            setLocalJiraCreated(firstReport.id, rowIndex, { jiraKey: match.key });
-            linked++;
-          } catch {
-            /* skip individual link errors */
-          }
+        }
+        if (!match) continue;
+        usedIssueKeys.add(match.key);
+        try {
+          await linkJiraTicket({
+            messageId: firstReport.id,
+            rowIndex: plan.rowIndex,
+            jiraKey: match.key,
+          });
+          setLocalJiraCreated(firstReport.id, plan.rowIndex, { jiraKey: match.key });
+          linked++;
+        } catch {
+          /* skip individual link errors */
         }
       }
       toast({
         title: "Link existing Jira tickets",
         description:
           linked > 0
-            ? `Linked ${linked} Jira ticket(s) to alerts for this day -- saved to the database.`
-            : "No matching Jira tickets found. Issue summary must contain the same INC/Servicenow ID as the row (we search up to 1500 newest issues in the project).",
+            ? `Linked ${linked} Jira ticket(s) for this day — saved to the database (jira_created_tickets).`
+            : `No matches linked. Searched ${uniqueTokens.length} INC/CS ID(s) in Jira (${tokensWithHits} had hits). Each Jira issue summary or description must contain the same INC/CS as the alert row. Links are only saved when a match is found — use Create all in Jira to create and save new tickets.`,
       });
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Failed to fetch Jira issues";
@@ -1231,31 +1391,15 @@ export default function JiraTickets() {
 
           {!loading && firstReport && (
             <div className="shrink-0 border-b border-border bg-background px-6 py-2 shadow-sm">
-              <div className="grid grid-cols-1 max-w-xl gap-2">
-                <Card className="border border-border shadow-sm bg-blue-500/5">
-                  <CardContent className="p-2">
-                    <div className="flex items-center gap-1.5 mb-1">
-                      <FileText className="h-4 w-4 text-blue-600 dark:text-blue-400 shrink-0" />
-                      <p className="text-xs font-semibold text-blue-700 dark:text-blue-300 uppercase tracking-wide">Report date</p>
-                    </div>
-                    <p className="text-[10px] text-muted-foreground truncate mb-0.5">{formatReportDate(firstReport)}</p>
-                    <p className="text-lg font-bold text-foreground mb-1">Total: {firstReportStats.total} alerts</p>
-                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-x-2 gap-y-0.5 text-xs">
-                      <span className="text-muted-foreground">Open:</span>
-                      <span className="font-medium text-foreground">{firstReportStats.open}</span>
-                      <span className="text-muted-foreground">Closed:</span>
-                      <span className="font-medium text-foreground">{firstReportStats.closed}</span>
-                      <span className="text-muted-foreground">Merged:</span>
-                      <span className="font-medium text-foreground">{firstReportStats.merged}</span>
-                      <span className="text-muted-foreground">Pending:</span>
-                      <span className="font-medium text-foreground">{firstReportStats.pending}</span>
-                      <span className="text-muted-foreground">In progress:</span>
-                      <span className="font-medium text-foreground">{firstReportStats.inProgress}</span>
-                      <span className="text-muted-foreground">Incident Auto Closed:</span>
-                      <span className="font-medium text-foreground">{firstReportStats.incidentAutoClosed}</span>
-                    </div>
-                  </CardContent>
-                </Card>
+              <div className="w-full">
+                <ReportStatusSummaryCard
+                  variant="blue"
+                  title="Report date"
+                  subtitle={formatReportDate(firstReport)}
+                  total={firstReportStats.total}
+                  counts={firstReportStats}
+                  pendingLabel="Confirmation pending from End user"
+                />
               </div>
             </div>
           )}
@@ -1293,17 +1437,15 @@ export default function JiraTickets() {
                         </p>
                       </div>
                       <div className="flex items-center gap-2 shrink-0">
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          disabled={fetchingAllStatus}
-                          onClick={() => handleFetchAllLatestStatus()}
-                          title="Fetch latest status from email for all alerts on this day only"
-                        >
-                          {fetchingAllStatus && fetchAllProgress
-                            ? `Fetching… ${fetchAllProgress.current}/${fetchAllProgress.total}`
-                            : "Fetch all (this day)"}
-                        </Button>
+                        <FetchAllReportButtons
+                          canResume={fetchAllResume.canResume}
+                          resumeFromRow={fetchAllResume.resumeFromIndex + 1}
+                          fetching={fetchingAllStatus}
+                          progress={fetchAllProgress}
+                          fetchAllLabel="Fetch all (this day)"
+                          onResume={() => void handleFetchAllLatestStatus(false)}
+                          onStartFromBeginning={() => void handleFetchAllLatestStatus(true)}
+                        />
                         <Button
                           variant="outline"
                           size="sm"
